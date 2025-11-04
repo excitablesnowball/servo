@@ -1150,7 +1150,7 @@ impl<T: ClipboardProvider> TextInput<T> {
                 if matches!(key, Key::Named(NamedKey::Process)) {
                     return KeyReaction::DispatchInput(
                         None,
-                        IsComposing::NotComposing,
+                        IsComposing::Composing,
                         InputType::Nothing,
                     );
                 }
