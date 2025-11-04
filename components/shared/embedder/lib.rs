@@ -26,7 +26,7 @@ use base::Epoch;
 use base::generic_channel::{GenericCallback, GenericSender, SendResult};
 use base::id::{PipelineId, WebViewId};
 use crossbeam_channel::Sender;
-use euclid::{Point2D, Scale, Size2D};
+use euclid::{Box2D, Point2D, Scale, Size2D, Vector2D};
 use http::{HeaderMap, Method, StatusCode};
 use ipc_channel::ipc::{IpcSender, IpcSharedMemory};
 use log::warn;
@@ -42,10 +42,128 @@ use style_traits::CSSPixel;
 use url::Url;
 use uuid::Uuid;
 use webrender_api::ExternalScrollId;
-use webrender_api::units::{DeviceIntPoint, DeviceIntRect, DeviceIntSize, DevicePixel, LayoutSize};
+use webrender_api::units::{
+    DeviceIntPoint, DeviceIntRect, DeviceIntSize, DevicePixel, DevicePoint, DeviceRect,
+    DeviceVector2D, LayoutPoint, LayoutRect, LayoutSize, LayoutVector2D,
+};
 
 pub use crate::input_events::*;
 pub use crate::webdriver::*;
+
+/// A point in a `WebView`, either expressed in device pixels or page pixels.
+/// Page pixels are CSS pixels, which take into account device pixel scale,
+/// page zoom, and pinch zoom.
+#[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub enum WebViewPoint {
+    Device(DevicePoint),
+    Page(Point2D<f32, CSSPixel>),
+}
+
+impl WebViewPoint {
+    pub fn as_device_point(&self, scale: Scale<f32, CSSPixel, DevicePixel>) -> DevicePoint {
+        match self {
+            Self::Device(point) => *point,
+            Self::Page(point) => *point * scale,
+        }
+    }
+}
+
+impl From<DevicePoint> for WebViewPoint {
+    fn from(point: DevicePoint) -> Self {
+        Self::Device(point)
+    }
+}
+
+impl From<LayoutPoint> for WebViewPoint {
+    fn from(point: LayoutPoint) -> Self {
+        Self::Page(Point2D::new(point.x, point.y))
+    }
+}
+
+impl From<Point2D<f32, CSSPixel>> for WebViewPoint {
+    fn from(point: Point2D<f32, CSSPixel>) -> Self {
+        Self::Page(point)
+    }
+}
+
+/// A rectangle in a `WebView`, either expressed in device pixels or page pixels.
+/// Page pixels are CSS pixels, which take into account device pixel scale,
+/// page zoom, and pinch zoom.
+#[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub enum WebViewRect {
+    Device(DeviceRect),
+    Page(Box2D<f32, CSSPixel>),
+}
+
+impl WebViewRect {
+    pub fn as_device_rect(&self, scale: Scale<f32, CSSPixel, DevicePixel>) -> DeviceRect {
+        match self {
+            Self::Device(rect) => *rect,
+            Self::Page(rect) => *rect * scale,
+        }
+    }
+}
+
+impl From<DeviceRect> for WebViewRect {
+    fn from(rect: DeviceRect) -> Self {
+        Self::Device(rect)
+    }
+}
+
+impl From<LayoutRect> for WebViewRect {
+    fn from(rect: LayoutRect) -> Self {
+        Self::Page(Box2D::new(
+            Point2D::new(rect.min.x, rect.min.y),
+            Point2D::new(rect.max.x, rect.max.y),
+        ))
+    }
+}
+
+impl From<Box2D<f32, CSSPixel>> for WebViewRect {
+    fn from(rect: Box2D<f32, CSSPixel>) -> Self {
+        Self::Page(rect)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub enum WebViewVector {
+    Device(DeviceVector2D),
+    Page(Vector2D<f32, CSSPixel>),
+}
+
+impl WebViewVector {
+    pub fn as_device_vector(&self, scale: Scale<f32, CSSPixel, DevicePixel>) -> DeviceVector2D {
+        match self {
+            Self::Device(vector) => *vector,
+            Self::Page(vector) => *vector * scale,
+        }
+    }
+}
+
+impl From<DeviceVector2D> for WebViewVector {
+    fn from(vector: DeviceVector2D) -> Self {
+        Self::Device(vector)
+    }
+}
+
+impl From<LayoutVector2D> for WebViewVector {
+    fn from(vector: LayoutVector2D) -> Self {
+        Self::Page(Vector2D::new(vector.x, vector.y))
+    }
+}
+
+impl From<Vector2D<f32, CSSPixel>> for WebViewVector {
+    fn from(vector: Vector2D<f32, CSSPixel>) -> Self {
+        Self::Page(vector)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub enum Scroll {
+    Delta(WebViewVector),
+    Start,
+    End,
+}
 
 /// Tracks whether Servo isn't shutting down, is in the process of shutting down,
 /// or has finished shutting down.
@@ -160,18 +278,21 @@ pub enum SimpleDialog {
     /// [`alert()`](https://html.spec.whatwg.org/multipage/#dom-alert).
     /// TODO: Include details about the document origin.
     Alert {
+        id: EmbedderControlId,
         message: String,
         response_sender: GenericSender<AlertResponse>,
     },
     /// [`confirm()`](https://html.spec.whatwg.org/multipage/#dom-confirm).
     /// TODO: Include details about the document origin.
     Confirm {
+        id: EmbedderControlId,
         message: String,
         response_sender: GenericSender<ConfirmResponse>,
     },
     /// [`prompt()`](https://html.spec.whatwg.org/multipage/#dom-prompt).
     /// TODO: Include details about the document origin.
     Prompt {
+        id: EmbedderControlId,
         message: String,
         default: String,
         response_sender: GenericSender<PromptResponse>,
@@ -237,6 +358,14 @@ impl SimpleDialog {
             },
         }
     }
+
+    pub fn id(&self) -> EmbedderControlId {
+        match self {
+            SimpleDialog::Alert { id, .. } |
+            SimpleDialog::Confirm { id, .. } |
+            SimpleDialog::Prompt { id, .. } => *id,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -247,53 +376,38 @@ pub struct AuthenticationResponse {
     pub password: String,
 }
 
-#[derive(Deserialize, PartialEq, Serialize)]
+#[derive(Default, Deserialize, PartialEq, Serialize)]
 pub enum AlertResponse {
+    // Per <https://html.spec.whatwg.org/multipage/#dom-alert>,
+    // if we **cannot show simple dialogs**, including cases where the user or user agent decides to ignore
+    // all modal dialogs, we need to return (which represents Ok).
+    #[default]
     /// The user chose Ok, or the dialog was otherwise dismissed or ignored.
     Ok,
 }
 
-impl Default for AlertResponse {
-    fn default() -> Self {
-        // Per <https://html.spec.whatwg.org/multipage/#dom-alert>,
-        // if we **cannot show simple dialogs**, including cases where the user or user agent decides to ignore
-        // all modal dialogs, we need to return (which represents Ok).
-        Self::Ok
-    }
-}
-
-#[derive(Deserialize, PartialEq, Serialize)]
+#[derive(Default, Deserialize, PartialEq, Serialize)]
 pub enum ConfirmResponse {
     /// The user chose Ok.
     Ok,
+    // Per <https://html.spec.whatwg.org/multipage/#dom-confirm>,
+    // if we **cannot show simple dialogs**, including cases where the user or user agent decides to ignore
+    // all modal dialogs, we need to return false (which represents Cancel), not true (Ok).
+    #[default]
     /// The user chose Cancel, or the dialog was otherwise dismissed or ignored.
     Cancel,
 }
 
-impl Default for ConfirmResponse {
-    fn default() -> Self {
-        // Per <https://html.spec.whatwg.org/multipage/#dom-confirm>,
-        // if we **cannot show simple dialogs**, including cases where the user or user agent decides to ignore
-        // all modal dialogs, we need to return false (which represents Cancel), not true (Ok).
-        Self::Cancel
-    }
-}
-
-#[derive(Deserialize, PartialEq, Serialize)]
+#[derive(Default, Deserialize, PartialEq, Serialize)]
 pub enum PromptResponse {
     /// The user chose Ok, with the given input.
     Ok(String),
+    // Per <https://html.spec.whatwg.org/multipage/#dom-prompt>,
+    // if we **cannot show simple dialogs**, including cases where the user or user agent decides to ignore
+    // all modal dialogs, we need to return null (which represents Cancel), not the default input.
+    #[default]
     /// The user chose Cancel, or the dialog was otherwise dismissed or ignored.
     Cancel,
-}
-
-impl Default for PromptResponse {
-    fn default() -> Self {
-        // Per <https://html.spec.whatwg.org/multipage/#dom-prompt>,
-        // if we **cannot show simple dialogs**, including cases where the user or user agent decides to ignore
-        // all modal dialogs, we need to return null (which represents Cancel), not the default input.
-        Self::Cancel
-    }
 }
 
 /// A response to a request to allow or deny an action.
@@ -383,7 +497,7 @@ pub struct Image {
     pub height: u32,
     pub format: PixelFormat,
     /// A shared memory block containing the data of one or more image frames.
-    data: IpcSharedMemory,
+    data: Arc<IpcSharedMemory>,
     range: Range<usize>,
 }
 
@@ -391,7 +505,7 @@ impl Image {
     pub fn new(
         width: u32,
         height: u32,
-        data: IpcSharedMemory,
+        data: Arc<IpcSharedMemory>,
         range: Range<usize>,
         format: PixelFormat,
     ) -> Self {
@@ -493,19 +607,6 @@ pub enum EmbedderMsg {
     ),
     /// Open interface to request permission specified by prompt.
     PromptPermission(WebViewId, PermissionFeature, GenericSender<AllowOrDeny>),
-    /// Request to present an IME to the user when an editable element is focused.
-    /// If the input is text, the second parameter defines the pre-existing string
-    /// text content and the zero-based index into the string locating the insertion point.
-    /// bool is true for multi-line and false otherwise.
-    ShowIME(
-        WebViewId,
-        InputMethodType,
-        Option<(String, i32)>,
-        bool,
-        DeviceIntRect,
-    ),
-    /// Request to hide the IME when the editable element is blurred.
-    HideIME(WebViewId),
     /// Report a complete sampled profile
     ReportProfile(Vec<u8>),
     /// Notifies the embedder about media session events
@@ -562,6 +663,20 @@ pub enum EmbedderControlRequest {
     ColorPicker(RgbColor),
     /// Indicates that the user has activated a `<input type=file>` element.
     FilePicker(FilePickerRequest),
+    /// Indicates that the the user has activated a text or input control that should show
+    /// an IME.
+    InputMethod(InputMethodRequest),
+}
+
+/// Request to present an IME to the user when an editable element is focused. If `type` is
+/// [`InputMethodType::Text`], then the `text` parameter specifies the pre-existing text content and
+/// `insertion_point` the zero-based index into the string of the insertion point.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct InputMethodRequest {
+    pub input_method_type: InputMethodType,
+    pub text: String,
+    pub insertion_point: Option<u32>,
+    pub multiline: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -677,7 +792,7 @@ pub enum PermissionFeature {
 /// Used to specify the kind of input method editor appropriate to edit a field.
 /// This is a subset of htmlinputelement::InputType because some variants of InputType
 /// don't make sense in this context.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 pub enum InputMethodType {
     Color,
     Date,

@@ -127,7 +127,7 @@ impl FileMethods<crate::DomTypeHolder> for File {
     ) -> Fallible<DomRoot<File>> {
         let bytes: Vec<u8> = match blob_parts_to_bytes(fileBits) {
             Ok(bytes) => bytes,
-            Err(_) => return Err(Error::InvalidCharacter),
+            Err(_) => return Err(Error::InvalidCharacter(None)),
         };
 
         let blobPropertyBag = &filePropertyBag.parent;
@@ -147,12 +147,12 @@ impl FileMethods<crate::DomTypeHolder> for File {
         ))
     }
 
-    // https://w3c.github.io/FileAPI/#dfn-name
+    /// <https://w3c.github.io/FileAPI/#dfn-name>
     fn Name(&self) -> DOMString {
         self.name.clone()
     }
 
-    // https://w3c.github.io/FileAPI/#dfn-lastModified
+    /// <https://w3c.github.io/FileAPI/#dfn-lastModified>
     fn LastModified(&self) -> i64 {
         // This is first converted to a `time::OffsetDateTime` because it might be from before the
         // Unix epoch in which case we will need to return a negative duration to script.

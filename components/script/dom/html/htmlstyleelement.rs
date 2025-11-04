@@ -13,7 +13,9 @@ use script_bindings::root::Dom;
 use servo_arc::Arc;
 use style::media_queries::MediaList as StyleMediaList;
 use style::shared_lock::DeepCloneWithLock;
-use style::stylesheets::{AllowImportRules, Origin, Stylesheet, StylesheetContents, UrlExtraData};
+use style::stylesheets::{
+    AllowImportRules, Origin, Stylesheet, StylesheetContents, StylesheetInDocument, UrlExtraData,
+};
 
 use crate::dom::attr::Attr;
 use crate::dom::bindings::cell::DomRefCell;
@@ -23,15 +25,17 @@ use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::csp::{CspReporting, InlineCheckType};
-use crate::dom::cssstylesheet::CSSStyleSheet;
+use crate::dom::css::cssstylesheet::CSSStyleSheet;
+use crate::dom::css::stylesheet::StyleSheet as DOMStyleSheet;
+use crate::dom::css::stylesheetcontentscache::{
+    StylesheetContentsCache, StylesheetContentsCacheKey,
+};
 use crate::dom::document::Document;
 use crate::dom::documentorshadowroot::StylesheetSource;
 use crate::dom::element::{AttributeMutation, Element, ElementCreator};
 use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::medialist::MediaList;
 use crate::dom::node::{BindContext, ChildrenMutation, Node, NodeTraits, UnbindContext};
-use crate::dom::stylesheet::StyleSheet as DOMStyleSheet;
-use crate::dom::stylesheetcontentscache::{StylesheetContentsCache, StylesheetContentsCacheKey};
 use crate::dom::virtualmethods::VirtualMethods;
 use crate::script_runtime::CanGc;
 use crate::stylesheet_loader::{ElementStylesheetLoader, StylesheetOwner};
@@ -164,7 +168,7 @@ impl HTMLStyleElement {
         );
 
         let sheet = Arc::new(Stylesheet {
-            contents,
+            contents: shared_lock.wrap(contents),
             shared_lock,
             media: mq,
             disabled: AtomicBool::new(false),
@@ -248,11 +252,11 @@ impl HTMLStyleElement {
         let lock = stylesheet_with_shared_contents.shared_lock.clone();
         let guard = stylesheet_with_shared_contents.shared_lock.read();
         let stylesheet_with_owned_contents = Arc::new(Stylesheet {
-            contents: Arc::new(
+            contents: lock.wrap(Arc::new(
                 stylesheet_with_shared_contents
-                    .contents
+                    .contents(&guard)
                     .deep_clone_with_lock(&lock, &guard),
-            ),
+            )),
             shared_lock: lock,
             media: stylesheet_with_shared_contents.media.clone(),
             disabled: AtomicBool::new(
@@ -295,8 +299,10 @@ impl VirtualMethods for HTMLStyleElement {
         Some(self.upcast::<HTMLElement>() as &dyn VirtualMethods)
     }
 
-    fn children_changed(&self, mutation: &ChildrenMutation) {
-        self.super_type().unwrap().children_changed(mutation);
+    fn children_changed(&self, mutation: &ChildrenMutation, can_gc: CanGc) {
+        self.super_type()
+            .unwrap()
+            .children_changed(mutation, can_gc);
 
         // https://html.spec.whatwg.org/multipage/#update-a-style-block
         // Handles the case when:

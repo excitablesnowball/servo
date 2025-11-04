@@ -15,18 +15,21 @@ use android_logger::{self, Config, FilterBuilder};
 use jni::objects::{GlobalRef, JClass, JObject, JString, JValue, JValueOwned};
 use jni::sys::{jboolean, jfloat, jint, jobject};
 use jni::{JNIEnv, JavaVM};
+use keyboard_types::{Key, NamedKey};
 use log::{debug, error, info, warn};
 use raw_window_handle::{
     AndroidDisplayHandle, AndroidNdkWindowHandle, RawDisplayHandle, RawWindowHandle,
 };
 use servo::{
-    AlertResponse, EventLoopWaker, LoadStatus, MediaSessionActionType, MouseButton,
-    PermissionRequest, SimpleDialog, WebView,
+    AlertResponse, EventLoopWaker, InputMethodControl, LoadStatus, MediaSessionActionType,
+    MouseButton, PermissionRequest, PrefValue, SimpleDialog, WebView,
 };
-use simpleservo::{APP, DeviceIntRect, InitOptions, InputMethodType, MediaSessionPlaybackState};
+use simpleservo::{APP, InitOptions, MediaSessionPlaybackState};
 
 use super::app_state::{Coordinates, RunningAppState};
 use super::host_trait::HostTrait;
+use crate::prefs::EXPERIMENTAL_PREFS;
+use crate::running_app_state::RunningAppStateTrait;
 
 struct HostCallbacks {
     callbacks: GlobalRef,
@@ -48,7 +51,7 @@ pub extern "C" fn android_main() {
 
 fn call<F>(env: &mut JNIEnv, f: F)
 where
-    F: Fn(&RunningAppState),
+    F: FnOnce(&RunningAppState),
 {
     APP.with(|app| match app.borrow().as_ref() {
         Some(ref app_state) => (f)(app_state),
@@ -144,6 +147,20 @@ pub extern "C" fn Java_org_servo_servoview_JNIServo_init<'local>(
     if let Err(err) = simpleservo::init(opts, wakeup, callbacks) {
         throw(&mut env, err)
     };
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_org_servo_servoview_JNIServo_setExperimentalMode<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    enable: jboolean,
+) {
+    debug!("setExperimentalMode {enable}");
+    call(&mut env, |s| {
+        for pref in EXPERIMENTAL_PREFS {
+            s.servo().set_preference(pref, PrefValue::Bool(enable != 0));
+        }
+    });
 }
 
 #[unsafe(no_mangle)]
@@ -254,7 +271,92 @@ pub extern "C" fn Java_org_servo_servoview_JNIServo_scroll<'local>(
     y: jint,
 ) {
     debug!("scroll");
-    call(&mut env, |s| s.scroll(dx as f32, dy as f32, x, y));
+    call(&mut env, |s| {
+        s.scroll(dx as f32, dy as f32, x as f32, y as f32)
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_org_servo_servoview_JNIServo_doFrame<'local>(
+    mut env: JNIEnv<'local>,
+    _: JClass<'local>,
+) {
+    call(&mut env, |s| s.notify_vsync());
+}
+
+enum KeyCode {
+    Delete,
+    ForwardDelete,
+    Enter,
+    ArrowLeft,
+    ArrowRight,
+    ArrowUp,
+    ArrowDown,
+}
+
+impl TryFrom<i32> for KeyCode {
+    type Error = ();
+
+    // Values derived from <https://developer.android.com/reference/android/view/KeyEvent>
+    fn try_from(keycode: i32) -> Result<KeyCode, ()> {
+        Ok(match keycode {
+            66 => KeyCode::Enter,
+            67 => KeyCode::Delete,
+            112 => KeyCode::ForwardDelete,
+            21 => KeyCode::ArrowLeft,
+            22 => KeyCode::ArrowRight,
+            19 => KeyCode::ArrowUp,
+            20 => KeyCode::ArrowDown,
+            _ => return Err(()),
+        })
+    }
+}
+
+impl From<KeyCode> for Key {
+    fn from(keycode: KeyCode) -> Key {
+        Key::Named(match keycode {
+            KeyCode::Enter => NamedKey::Enter,
+            KeyCode::Delete => NamedKey::Backspace,
+            KeyCode::ForwardDelete => NamedKey::Delete,
+            KeyCode::ArrowLeft => NamedKey::ArrowLeft,
+            KeyCode::ArrowRight => NamedKey::ArrowRight,
+            KeyCode::ArrowUp => NamedKey::ArrowUp,
+            KeyCode::ArrowDown => NamedKey::ArrowDown,
+        })
+    }
+}
+
+fn key_from_unicode_keycode(unicode: u32, keycode: i32) -> Option<Key> {
+    char::from_u32(unicode)
+        .filter(|c| *c != '\0')
+        .map(|c| Key::Character(String::from(c)))
+        .or_else(|| KeyCode::try_from(keycode).ok().map(Key::from))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_org_servo_servoview_JNIServo_keydown<'local>(
+    mut env: JNIEnv<'local>,
+    _: JClass<'local>,
+    keycode: jint,
+    unicode: jint,
+) {
+    debug!("keydown {keycode}");
+    if let Some(key) = key_from_unicode_keycode(unicode as u32, keycode) {
+        call(&mut env, move |s| s.key_down(key));
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_org_servo_servoview_JNIServo_keyup<'local>(
+    mut env: JNIEnv<'local>,
+    _: JClass<'local>,
+    keycode: jint,
+    unicode: jint,
+) {
+    debug!("keyup {keycode}");
+    if let Some(key) = key_from_unicode_keycode(unicode as u32, keycode) {
+        call(&mut env, move |s| s.key_up(key));
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -310,11 +412,11 @@ pub extern "C" fn Java_org_servo_servoview_JNIServo_pinchZoomStart<'local>(
     mut env: JNIEnv<'local>,
     _: JClass<'local>,
     factor: jfloat,
-    x: jint,
-    y: jint,
+    x: jfloat,
+    y: jfloat,
 ) {
     debug!("pinchZoomStart");
-    call(&mut env, |s| s.pinchzoom_start(factor, x as u32, y as u32));
+    call(&mut env, |s| s.pinchzoom_start(factor, x, y));
 }
 
 #[unsafe(no_mangle)]
@@ -322,11 +424,11 @@ pub extern "C" fn Java_org_servo_servoview_JNIServo_pinchZoom<'local>(
     mut env: JNIEnv<'local>,
     _: JClass<'local>,
     factor: jfloat,
-    x: jint,
-    y: jint,
+    x: jfloat,
+    y: jfloat,
 ) {
     debug!("pinchZoom");
-    call(&mut env, |s| s.pinchzoom(factor, x as u32, y as u32));
+    call(&mut env, |s| s.pinchzoom(factor, x, y));
 }
 
 #[unsafe(no_mangle)]
@@ -334,11 +436,11 @@ pub extern "C" fn Java_org_servo_servoview_JNIServo_pinchZoomEnd<'local>(
     mut env: JNIEnv<'local>,
     _: JClass<'local>,
     factor: jfloat,
-    x: jint,
-    y: jint,
+    x: jfloat,
+    y: jfloat,
 ) {
     debug!("pinchZoomEnd");
-    call(&mut env, |s| s.pinchzoom_end(factor, x as u32, y as u32));
+    call(&mut env, |s| s.pinchzoom_end(factor, x, y));
 }
 
 #[unsafe(no_mangle)]
@@ -465,6 +567,7 @@ impl HostTrait for HostCallbacks {
             SimpleDialog::Alert {
                 message,
                 response_sender,
+                ..
             } => {
                 debug!("SimpleDialog::Alert");
                 // TODO: Indicate that this message is untrusted, and what origin it came from.
@@ -474,6 +577,7 @@ impl HostTrait for HostCallbacks {
             SimpleDialog::Confirm {
                 message,
                 response_sender,
+                ..
             } => {
                 warn!("Confirm dialog not implemented. Cancelled. {}", message);
                 response_sender.send(Default::default())
@@ -588,15 +692,17 @@ impl HostTrait for HostCallbacks {
         .unwrap();
     }
 
-    fn on_ime_show(
-        &self,
-        _input_type: InputMethodType,
-        _text: Option<(String, i32)>,
-        _multiline: bool,
-        _rect: DeviceIntRect,
-    ) {
+    fn on_ime_show(&self, _: InputMethodControl) {
+        let mut env = self.jvm.get_env().unwrap();
+        env.call_method(self.callbacks.as_obj(), "onImeShow", "()V", &[])
+            .unwrap();
     }
-    fn on_ime_hide(&self) {}
+
+    fn on_ime_hide(&self) {
+        let mut env = self.jvm.get_env().unwrap();
+        env.call_method(self.callbacks.as_obj(), "onImeHide", "()V", &[])
+            .unwrap();
+    }
 
     fn on_media_session_metadata(&self, title: String, artist: String, album: String) {
         info!("on_media_session_metadata");
@@ -769,6 +875,9 @@ fn get_options<'local>(
     let url = get_field_as_string(env, opts, "url")?;
     let log_str = get_field_as_string(env, opts, "logStr")?;
     let gst_debug_str = get_field_as_string(env, opts, "gstDebugStr")?;
+    let experimental_mode = get_non_null_field(env, opts, "experimentalMode", "Z")?
+        .z()
+        .map_err(|_| "experimentalMode not a boolean")?;
     let density = get_non_null_field(env, opts, "density", "F")?
         .f()
         .map_err(|_| "density not a float")? as f32;
@@ -785,15 +894,19 @@ fn get_options<'local>(
     .map_err(|_| "coordinates is not an object")?;
     let coordinates = jni_coords_to_rust_coords(env, &coordinates)?;
 
-    let args = match args {
+    let mut args: Vec<String> = match args {
         Some(args) => serde_json::from_str(&args)
             .map_err(|_| "Invalid arguments. Servo arguments must be formatted as a JSON array")?,
         None => None,
-    };
+    }
+    .unwrap_or_default();
+    if experimental_mode {
+        args.push("--enable-experimental-web-platform-features".to_owned());
+    }
 
     let (display_handle, window_handle) = display_and_window_handle(env, surface);
     let opts = InitOptions {
-        args: args.unwrap_or(vec![]),
+        args,
         url,
         coordinates,
         density,

@@ -26,8 +26,8 @@ use fonts_traits::StylesheetWebFontLoadFinishedCallback;
 use layout_api::wrapper_traits::LayoutNode;
 use layout_api::{
     BoxAreaType, IFrameSizes, Layout, LayoutConfig, LayoutDamage, LayoutFactory,
-    OffsetParentResponse, PropertyRegistration, QueryMsg, ReflowGoal, ReflowPhasesRun,
-    ReflowRequest, ReflowRequestRestyle, ReflowResult, RegisterPropertyError,
+    OffsetParentResponse, PhysicalSides, PropertyRegistration, QueryMsg, ReflowGoal,
+    ReflowPhasesRun, ReflowRequest, ReflowRequestRestyle, ReflowResult, RegisterPropertyError,
     ScrollContainerQueryFlags, ScrollContainerResponse, TrustedNodeAddress,
 };
 use log::{debug, error, warn};
@@ -87,11 +87,13 @@ use webrender_api::ExternalScrollId;
 use webrender_api::units::{DevicePixel, LayoutVector2D};
 
 use crate::context::{CachedImageOrError, ImageResolver, LayoutContext};
-use crate::display_list::{DisplayListBuilder, HitTest, StackingContextTree};
+use crate::display_list::{
+    DisplayListBuilder, HitTest, LargestContentfulPaintCandidateCollector, StackingContextTree,
+};
 use crate::query::{
     get_the_text_steps, process_box_area_request, process_box_areas_request,
     process_client_rect_request, process_node_scroll_area_request, process_offset_parent_query,
-    process_resolved_font_style_query, process_resolved_style_request,
+    process_padding_request, process_resolved_font_style_query, process_resolved_style_request,
     process_scroll_container_query, process_text_index_request,
 };
 use crate::traversal::{RecalcStyle, compute_damage_and_repair_style};
@@ -193,6 +195,9 @@ pub struct LayoutThread {
     ///
     /// If this changed, then we need to create a new display list.
     previously_highlighted_dom_node: Cell<Option<OpaqueNode>>,
+
+    /// The collector for calculating Largest Contentful Paint
+    lcp_candidate_collector: RefCell<Option<LargestContentfulPaintCandidateCollector>>,
 }
 
 pub struct LayoutFactoryImpl();
@@ -255,6 +260,19 @@ impl Layout for LayoutThread {
             .remove_all_web_fonts_from_stylesheet(&stylesheet);
     }
 
+    /// Return the resolved values of this node's padding rect.
+    #[servo_tracing::instrument(skip_all)]
+    fn query_padding(&self, node: TrustedNodeAddress) -> Option<PhysicalSides> {
+        // If we have not built a fragment tree yet, there is no way we have layout information for
+        // this query, which can be run without forcing a layout (for IntersectionObserver).
+        if self.fragment_tree.borrow().is_none() {
+            return None;
+        }
+
+        let node = unsafe { ServoLayoutNode::new(&node) };
+        process_padding_request(node.to_threadsafe())
+    }
+
     /// Return the union of this node's areas in the coordinate space of the Document. This is used
     /// to implement `getBoundingClientRect()` and support many other API where the such query is
     /// required.
@@ -265,6 +283,7 @@ impl Layout for LayoutThread {
         &self,
         node: TrustedNodeAddress,
         area: BoxAreaType,
+        exclude_transform_and_inline: bool,
     ) -> Option<UntypedRect<Au>> {
         // If we have not built a fragment tree yet, there is no way we have layout information for
         // this query, which can be run without forcing a layout (for IntersectionObserver).
@@ -277,7 +296,12 @@ impl Layout for LayoutThread {
         let stacking_context_tree = stacking_context_tree
             .as_ref()
             .expect("Should always have a StackingContextTree for box area queries");
-        process_box_area_request(stacking_context_tree, node.to_threadsafe(), area)
+        process_box_area_request(
+            stacking_context_tree,
+            node.to_threadsafe(),
+            area,
+            exclude_transform_and_inline,
+        )
     }
 
     /// Get a `Vec` of bounding boxes of this node's `Fragment`s specific area in the coordinate space of
@@ -682,6 +706,7 @@ impl LayoutThread {
             resolved_images_cache: Default::default(),
             debug: opts::get().debug.clone(),
             previously_highlighted_dom_node: Cell::new(None),
+            lcp_candidate_collector: Default::default(),
         }
     }
 
@@ -987,7 +1012,7 @@ impl LayoutThread {
             iframe_sizes: Mutex::default(),
             use_rayon: rayon_pool.is_some(),
             image_resolver: image_resolver.clone(),
-            rendering_group_id: self.webview_id.into(),
+            painter_id: self.webview_id.into(),
         };
 
         let restyle = reflow_request
@@ -1226,6 +1251,21 @@ impl LayoutThread {
         // ensuring that the Epoch is passed to any method that can creates `StackingContextTree`.
         stacking_context_tree.compositor_info.epoch = reflow_request.epoch;
 
+        let mut lcp_candidate_collector = self.lcp_candidate_collector.borrow_mut();
+        if pref!(largest_contentful_paint_enabled) {
+            // This ensures that we only create the LCP collector once per layout thread.
+            if lcp_candidate_collector.is_none() {
+                *lcp_candidate_collector = Some(LargestContentfulPaintCandidateCollector::new(
+                    stacking_context_tree
+                        .compositor_info
+                        .viewport_details
+                        .layout_size(),
+                ));
+            }
+        } else {
+            *lcp_candidate_collector = None;
+        }
+
         let built_display_list = DisplayListBuilder::build(
             stacking_context_tree,
             fragment_tree,
@@ -1233,12 +1273,26 @@ impl LayoutThread {
             self.device().device_pixel_ratio(),
             reflow_request.highlighted_dom_node,
             &self.debug,
+            lcp_candidate_collector.as_mut(),
         );
         self.compositor_api.send_display_list(
             self.webview_id,
             &stacking_context_tree.compositor_info,
             built_display_list,
         );
+        if let Some(lcp_candidate_collector) = lcp_candidate_collector.as_mut() {
+            if lcp_candidate_collector.did_lcp_candidate_update {
+                if let Some(lcp_candidate) = lcp_candidate_collector.largest_contentful_paint() {
+                    self.compositor_api.send_lcp_candidate(
+                        lcp_candidate,
+                        self.webview_id,
+                        self.id,
+                        stacking_context_tree.compositor_info.epoch,
+                    );
+                    lcp_candidate_collector.did_lcp_candidate_update = false;
+                }
+            }
+        }
 
         let (keys, instance_keys) = self
             .font_context
@@ -1272,7 +1326,7 @@ impl LayoutThread {
                 ScrollType::Script,
             )
         {
-            self.compositor_api.send_scroll_node(
+            self.compositor_api.scroll_node_by_delta(
                 self.webview_id,
                 self.id.into(),
                 offset,
@@ -1622,6 +1676,7 @@ impl ReflowPhases {
                 QueryMsg::ClientRectQuery |
                 QueryMsg::ElementInnerOuterTextQuery |
                 QueryMsg::InnerWindowDimensionsQuery |
+                QueryMsg::PaddingQuery |
                 QueryMsg::ResolvedFontStyleQuery |
                 QueryMsg::ScrollParentQuery |
                 QueryMsg::StyleQuery |

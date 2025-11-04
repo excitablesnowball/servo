@@ -31,18 +31,18 @@ use crate::inheritance::Castable;
 use crate::num::Finite;
 use crate::reflector::{DomObject, Reflector};
 use crate::root::DomRoot;
-use crate::script_runtime::JSContext as SafeJSContext;
+use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
 use crate::str::{ByteString, DOMString, USVString};
 use crate::trace::RootedTraceableBox;
 use crate::utils::{DOMClass, DOMJSClass};
 
 /// A safe wrapper for `ToJSValConvertible`.
 pub trait SafeToJSValConvertible {
-    fn safe_to_jsval(&self, cx: SafeJSContext, rval: MutableHandleValue);
+    fn safe_to_jsval(&self, cx: SafeJSContext, rval: MutableHandleValue, can_gc: CanGc);
 }
 
 impl<T: ToJSValConvertible + ?Sized> SafeToJSValConvertible for T {
-    fn safe_to_jsval(&self, cx: SafeJSContext, rval: MutableHandleValue) {
+    fn safe_to_jsval(&self, cx: SafeJSContext, rval: MutableHandleValue, _can_gc: CanGc) {
         unsafe { self.to_jsval(*cx, rval) };
     }
 }
@@ -107,14 +107,9 @@ impl FromJSValConvertible for DOMString {
         if null_behavior == StringificationBehavior::Empty && value.get().is_null() {
             Ok(ConversionResult::Success(DOMString::new()))
         } else {
-            match ptr::NonNull::new(ToString(cx, value)) {
-                Some(jsstr) => Ok(ConversionResult::Success(DOMString::from_string(
-                    jsstr_to_string(cx, jsstr),
-                ))),
-                None => {
-                    debug!("ToString failed");
-                    Err(())
-                },
+            match DOMString::from_js_string(unsafe { SafeJSContext::from_ptr(cx) }, value) {
+                Ok(domstring) => Ok(ConversionResult::Success(domstring)),
+                Err(_) => Err(()),
             }
         }
     }

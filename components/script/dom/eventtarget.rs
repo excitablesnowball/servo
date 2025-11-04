@@ -487,7 +487,7 @@ impl DerefMut for EventListeners {
 }
 
 impl EventListeners {
-    // https://html.spec.whatwg.org/multipage/#getting-the-current-value-of-the-event-handler
+    /// <https://html.spec.whatwg.org/multipage/#getting-the-current-value-of-the-event-handler>
     fn get_inline_listener(
         &self,
         owner: &EventTarget,
@@ -1069,6 +1069,7 @@ impl EventTarget {
             // * A is not a node
             // * A’s root is not a shadow root
             // * B is a node and A’s root is a shadow-including inclusive ancestor of B
+            // then return A.
             let Some(a_node) = a.downcast::<Node>() else {
                 return a;
             };
@@ -1100,7 +1101,7 @@ impl EventTarget {
 }
 
 impl EventTargetMethods<crate::DomTypeHolder> for EventTarget {
-    // https://dom.spec.whatwg.org/#dom-eventtarget-eventtarget
+    /// <https://dom.spec.whatwg.org/#dom-eventtarget-eventtarget>
     fn Constructor(
         global: &GlobalScope,
         proto: Option<HandleObject>,
@@ -1109,7 +1110,7 @@ impl EventTargetMethods<crate::DomTypeHolder> for EventTarget {
         Ok(EventTarget::new(global, proto, can_gc))
     }
 
-    // https://dom.spec.whatwg.org/#dom-eventtarget-addeventlistener
+    /// <https://dom.spec.whatwg.org/#dom-eventtarget-addeventlistener>
     fn AddEventListener(
         &self,
         ty: DOMString,
@@ -1119,7 +1120,7 @@ impl EventTargetMethods<crate::DomTypeHolder> for EventTarget {
         self.add_event_listener(ty, listener, options.convert())
     }
 
-    // https://dom.spec.whatwg.org/#dom-eventtarget-removeeventlistener
+    /// <https://dom.spec.whatwg.org/#dom-eventtarget-removeeventlistener>
     fn RemoveEventListener(
         &self,
         ty: DOMString,
@@ -1129,7 +1130,7 @@ impl EventTargetMethods<crate::DomTypeHolder> for EventTarget {
         self.remove_event_listener(ty, &listener, &options.convert())
     }
 
-    // https://dom.spec.whatwg.org/#dom-eventtarget-dispatchevent
+    /// <https://dom.spec.whatwg.org/#dom-eventtarget-dispatchevent>
     fn DispatchEvent(&self, event: &Event, can_gc: CanGc) -> Fallible<bool> {
         if event.dispatching() || !event.initialized() {
             return Err(Error::InvalidState(None));

@@ -79,7 +79,6 @@ use std::mem;
 use std::rc::Rc;
 
 use app_units::{Au, MAX_AU};
-use base::id::RenderingGroupId;
 use bitflags::bitflags;
 use construct::InlineFormattingContextBuilder;
 use fonts::{ByteIndex, FontMetrics, GlyphStore};
@@ -244,33 +243,6 @@ impl InlineItem {
                 .repair_style(context, node, new_style),
             InlineItem::Atomic(atomic, ..) => {
                 atomic.borrow_mut().repair_style(context, node, new_style)
-            },
-        }
-    }
-
-    pub(crate) fn clear_fragment_layout_cache(&self) {
-        match self {
-            InlineItem::StartInlineBox(inline_box) => {
-                inline_box.borrow().base.clear_fragment_layout_cache()
-            },
-            InlineItem::EndInlineBox | InlineItem::TextRun(..) => {},
-            InlineItem::OutOfFlowAbsolutelyPositionedBox(positioned_box, ..) => {
-                positioned_box
-                    .borrow()
-                    .context
-                    .base
-                    .clear_fragment_layout_cache();
-            },
-            InlineItem::OutOfFlowFloatBox(float_box) => float_box
-                .borrow()
-                .contents
-                .base
-                .clear_fragment_layout_cache(),
-            InlineItem::Atomic(independent_formatting_context, ..) => {
-                independent_formatting_context
-                    .borrow()
-                    .base
-                    .clear_fragment_layout_cache()
             },
         }
     }
@@ -801,15 +773,12 @@ impl InlineFormattingContextLayout<'_> {
     }
 
     fn processing_br_element(&self) -> bool {
-        self.inline_box_state_stack
-            .last()
-            .map(|state| {
-                state
-                    .base_fragment_info
-                    .flags
-                    .contains(FragmentFlags::IS_BR_ELEMENT)
-            })
-            .unwrap_or(false)
+        self.inline_box_state_stack.last().is_some_and(|state| {
+            state
+                .base_fragment_info
+                .flags
+                .contains(FragmentFlags::IS_BR_ELEMENT)
+        })
     }
 
     /// Start laying out a particular [`InlineBox`] into line items. This will push
@@ -1683,7 +1652,6 @@ impl InlineFormattingContext {
         has_first_formatted_line: bool,
         is_single_line_text_input: bool,
         starting_bidi_level: Level,
-        rendering_group_id: RenderingGroupId,
     ) -> Self {
         // This is to prevent a double borrow.
         let text_content: String = builder.text_segments.into_iter().collect();
@@ -1698,11 +1666,10 @@ impl InlineFormattingContext {
                 InlineItem::TextRun(text_run) => {
                     text_run.borrow_mut().segment_and_shape(
                         &text_content,
-                        &layout_context.font_context,
+                        layout_context,
                         &mut new_linebreaker,
                         &mut font_metrics,
                         &bidi_info,
-                        rendering_group_id,
                     );
                 },
                 InlineItem::StartInlineBox(inline_box) => {
@@ -1711,12 +1678,8 @@ impl InlineFormattingContext {
                         &inline_box.base.style,
                         &layout_context.font_context,
                     ) {
-                        inline_box.default_font_index = Some(add_or_get_font(
-                            &font,
-                            &mut font_metrics,
-                            &layout_context.font_context,
-                            rendering_group_id,
-                        ));
+                        inline_box.default_font_index =
+                            Some(add_or_get_font(layout_context, &font, &mut font_metrics));
                     }
                 },
                 InlineItem::Atomic(_, index_in_text, bidi_level) => {
@@ -2353,8 +2316,7 @@ fn inline_container_needs_strut(
         return true;
     }
 
-    pbm.map(|pbm| !pbm.padding_border_sums.inline.is_zero())
-        .unwrap_or(false)
+    pbm.is_some_and(|pbm| !pbm.padding_border_sums.inline.is_zero())
 }
 
 impl ComputeInlineContentSizes for InlineFormattingContext {

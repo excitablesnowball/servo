@@ -29,8 +29,7 @@ use std::cell::{Cell, RefCell};
 use std::cmp::max;
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::Arc;
 
 use base::generic_channel::{GenericCallback, RoutedReceiver};
 pub use base::id::WebViewId;
@@ -39,17 +38,13 @@ use base::id::{PipelineNamespace, PipelineNamespaceId};
 use bluetooth::BluetoothThreadFactory;
 #[cfg(feature = "bluetooth")]
 use bluetooth_traits::BluetoothRequest;
-use canvas_traits::webgl::{GlType, WebGLThreads};
 use clipboard_delegate::StringRequest;
 pub use compositing::WebRenderDebugOption;
 use compositing::{IOCompositor, InitialCompositorState};
 pub use compositing_traits::rendering_context::{
     OffscreenRenderingContext, RenderingContext, SoftwareRenderingContext, WindowRenderingContext,
 };
-use compositing_traits::{
-    CompositorMsg, CompositorProxy, CrossProcessCompositorApi, WebrenderExternalImageHandlers,
-    WebrenderExternalImageRegistry, WebrenderImageHandlerType,
-};
+use compositing_traits::{CompositorMsg, CompositorProxy, CrossProcessCompositorApi};
 #[cfg(all(
     not(target_os = "windows"),
     not(target_os = "ios"),
@@ -80,7 +75,6 @@ use fonts::SystemFontService;
 ))]
 use gaol::sandbox::{ChildSandbox, ChildSandboxMethods};
 pub use gleam::gl;
-use gleam::gl::RENDERER;
 pub use image::RgbaImage;
 use ipc_channel::ipc::{self, IpcSender};
 use javascript_evaluator::JavaScriptEvaluator;
@@ -111,13 +105,6 @@ use servo_media::player::context::GlContext;
 use servo_url::ServoUrl;
 use storage::new_storage_threads;
 use style::global_style_data::StyleThreadPool;
-use webgl::WebGLComm;
-#[cfg(feature = "webgpu")]
-pub use webgpu;
-#[cfg(feature = "webgpu")]
-use webgpu::canvas_context::WGPUImageMap;
-use webrender::{ONE_TIME_USAGE_HINT, RenderApiSender, ShaderPrecacheFlags, UploadMethod};
-use webrender_api::{ColorF, DocumentId, FramePublishId};
 use webview::WebViewInner;
 #[cfg(feature = "webxr")]
 pub use webxr;
@@ -133,12 +120,12 @@ pub use {bluetooth, bluetooth_traits};
 use crate::proxies::ConstellationProxy;
 use crate::responders::ServoErrorChannel;
 pub use crate::servo_delegate::{ServoDelegate, ServoError};
-use crate::webrender_api::FrameReadyParams;
 use crate::webview::MINIMUM_WEBVIEW_SIZE;
 pub use crate::webview::{WebView, WebViewBuilder};
 pub use crate::webview_delegate::{
     AllowOrDenyRequest, AuthenticationRequest, ColorPicker, EmbedderControl, FilePicker,
-    NavigationRequest, PermissionRequest, SelectElement, WebResourceLoad, WebViewDelegate,
+    InputMethodControl, NavigationRequest, PermissionRequest, SelectElement, WebResourceLoad,
+    WebViewDelegate,
 };
 
 #[cfg(feature = "media-gstreamer")]
@@ -222,38 +209,6 @@ pub struct Servo {
     animating: Cell<bool>,
 }
 
-#[derive(Clone)]
-struct RenderNotifier {
-    compositor_proxy: CompositorProxy,
-}
-
-impl RenderNotifier {
-    pub fn new(compositor_proxy: CompositorProxy) -> RenderNotifier {
-        RenderNotifier { compositor_proxy }
-    }
-}
-
-impl webrender_api::RenderNotifier for RenderNotifier {
-    fn clone(&self) -> Box<dyn webrender_api::RenderNotifier> {
-        Box::new(RenderNotifier::new(self.compositor_proxy.clone()))
-    }
-
-    fn wake_up(&self, _composite_needed: bool) {}
-
-    fn new_frame_ready(
-        &self,
-        document_id: DocumentId,
-        _: FramePublishId,
-        frame_ready_params: &FrameReadyParams,
-    ) {
-        self.compositor_proxy
-            .send(CompositorMsg::NewWebRenderFrameReady(
-                document_id,
-                frame_ready_params.render,
-            ));
-    }
-}
-
 impl Servo {
     #[servo_tracing::instrument(skip(builder))]
     fn new(builder: ServoBuilder) -> Self {
@@ -280,16 +235,6 @@ impl Servo {
             media_platform::init();
         }
 
-        // Get GL bindings
-        let rendering_context = builder.rendering_context;
-        let webrender_gl = rendering_context.gleam_gl_api();
-
-        // Make sure the gl context is made current.
-        if let Err(err) = rendering_context.make_current() {
-            warn!("Failed to make the rendering context current: {:?}", err);
-        }
-        debug_assert_eq!(webrender_gl.get_error(), gleam::gl::NO_ERROR,);
-
         // Reserving a namespace to create WebViewId.
         PipelineNamespace::install(PipelineNamespaceId(0));
 
@@ -300,6 +245,7 @@ impl Servo {
         let event_loop_waker = builder.event_loop_waker;
         let (compositor_proxy, compositor_receiver) =
             create_compositor_channel(event_loop_waker.clone());
+        let (constellation_proxy, embedder_to_constellation_receiver) = ConstellationProxy::new();
         let (embedder_proxy, embedder_receiver) = create_embedder_channel(event_loop_waker.clone());
         let time_profiler_chan = profile_time::Profiler::create(
             &opts.time_profiling,
@@ -316,68 +262,6 @@ impl Servo {
             None
         };
 
-        let (mut webrender, webrender_api_sender) = {
-            rendering_context.prepare_for_rendering();
-            let render_notifier = Box::new(RenderNotifier::new(compositor_proxy.clone()));
-            let clear_color = servo_config::pref!(shell_background_color_rgba);
-            let clear_color = ColorF::new(
-                clear_color[0] as f32,
-                clear_color[1] as f32,
-                clear_color[2] as f32,
-                clear_color[3] as f32,
-            );
-
-            // Use same texture upload method as Gecko with ANGLE:
-            // https://searchfox.org/mozilla-central/source/gfx/webrender_bindings/src/bindings.rs#1215-1219
-            let upload_method = if webrender_gl.get_string(RENDERER).starts_with("ANGLE") {
-                UploadMethod::Immediate
-            } else {
-                UploadMethod::PixelBuffer(ONE_TIME_USAGE_HINT)
-            };
-            let worker_threads = thread::available_parallelism()
-                .map(|i| i.get())
-                .unwrap_or(pref!(threadpools_fallback_worker_num) as usize)
-                .min(pref!(threadpools_webrender_workers_max).max(1) as usize);
-            let workers = Some(Arc::new(
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(worker_threads)
-                    .thread_name(|idx| format!("WRWorker#{}", idx))
-                    .build()
-                    .unwrap(),
-            ));
-            webrender::create_webrender_instance(
-                webrender_gl.clone(),
-                render_notifier,
-                webrender::WebRenderOptions {
-                    // We force the use of optimized shaders here because rendering is broken
-                    // on Android emulators with unoptimized shaders. This is due to a known
-                    // issue in the emulator's OpenGL emulation layer.
-                    // See: https://github.com/servo/servo/issues/31726
-                    use_optimized_shaders: true,
-                    resource_override_path: opts.shaders_dir.clone(),
-                    debug_flags: webrender::DebugFlags::empty(),
-                    precache_flags: if pref!(gfx_precache_shaders) {
-                        ShaderPrecacheFlags::FULL_COMPILE
-                    } else {
-                        ShaderPrecacheFlags::empty()
-                    },
-                    enable_aa: pref!(gfx_text_antialiasing_enabled),
-                    enable_subpixel_aa: pref!(gfx_subpixel_text_antialiasing_enabled),
-                    allow_texture_swizzling: pref!(gfx_texture_swizzling_enabled),
-                    clear_color,
-                    upload_method,
-                    workers,
-                    size_of_op: Some(servo_allocator::usable_size),
-                    ..Default::default()
-                },
-                None,
-            )
-            .expect("Unable to initialize webrender!")
-        };
-
-        let webrender_api = webrender_api_sender.create_api();
-        let webrender_document = webrender_api.add_document(rendering_context.size2d().to_i32());
-
         // Important that this call is done in a single-threaded fashion, we
         // can't defer it after `create_constellation` has started.
         let js_engine_setup = if !opts.multiprocess {
@@ -386,107 +270,49 @@ impl Servo {
             None
         };
 
-        // Create the webgl thread
-        let gl_type = match webrender_gl.get_type() {
-            gleam::gl::GlType::Gl => GlType::Gl,
-            gleam::gl::GlType::Gles => GlType::Gles,
-        };
-
-        let (external_image_handlers, external_images) = WebrenderExternalImageHandlers::new();
-        let mut external_image_handlers = Box::new(external_image_handlers);
-
-        let WebGLComm {
-            webgl_threads,
-            #[cfg(feature = "webxr")]
-            webxr_layer_grand_manager,
-            image_handler,
-        } = WebGLComm::new(
-            rendering_context.clone(),
-            compositor_proxy.cross_process_compositor_api.clone(),
-            webrender_api.create_sender(),
-            external_images.clone(),
-            gl_type,
-        );
-
-        // Set webrender external image handler for WebGL textures
-        external_image_handlers.set_handler(image_handler, WebrenderImageHandlerType::WebGL);
-
-        // Create the WebXR main thread
-        #[cfg(feature = "webxr")]
-        let mut webxr_main_thread =
-            webxr::MainThreadRegistry::new(event_loop_waker.clone(), webxr_layer_grand_manager)
-                .expect("Failed to create WebXR device registry");
-        #[cfg(feature = "webxr")]
-        if pref!(dom_webxr_enabled) {
-            builder.webxr_registry.register(&mut webxr_main_thread);
-        }
-
-        #[cfg(feature = "webgpu")]
-        let wgpu_image_handler = webgpu::WGPUExternalImages::default();
-        #[cfg(feature = "webgpu")]
-        let wgpu_image_map = wgpu_image_handler.images.clone();
-        #[cfg(feature = "webgpu")]
-        external_image_handlers.set_handler(
-            Box::new(wgpu_image_handler),
-            WebrenderImageHandlerType::WebGPU,
-        );
-
-        WindowGLContext::initialize_image_handler(
-            &mut external_image_handlers,
-            external_images.clone(),
-        );
-
-        webrender.set_external_image_handler(external_image_handlers);
-
         // Create the constellation, which maintains the engine pipelines, including script and
         // layout, as well as the navigation context.
         let mut protocols = ProtocolRegistry::with_internal_protocols();
         protocols.merge(builder.protocol_registry);
 
-        let constellation_chan = create_constellation(
-            opts.config_dir.clone(),
-            embedder_proxy,
-            compositor_proxy.clone(),
-            time_profiler_chan.clone(),
-            mem_profiler_chan.clone(),
-            devtools_sender,
-            webrender_document,
-            webrender_api_sender,
-            #[cfg(feature = "webxr")]
-            webxr_main_thread.registry(),
-            Some(webgl_threads),
-            external_images,
-            #[cfg(feature = "webgpu")]
-            wgpu_image_map,
-            protocols,
-            builder.user_content_manager,
-        );
-
         // The compositor coordinates with the client window to create the final
         // rendered page and display it somewhere.
         let shutdown_state = Rc::new(Cell::new(ShutdownState::NotShuttingDown));
         let compositor = IOCompositor::new(InitialCompositorState {
-            sender: compositor_proxy,
+            compositor_proxy: compositor_proxy.clone(),
             receiver: compositor_receiver,
-            constellation_chan: constellation_chan.clone(),
-            time_profiler_chan,
-            mem_profiler_chan,
-            webrender,
-            webrender_document,
-            webrender_api,
-            rendering_context,
-            webrender_gl,
-            #[cfg(feature = "webxr")]
-            webxr_main_thread,
+            embedder_to_constellation_sender: constellation_proxy.sender().clone(),
+            time_profiler_chan: time_profiler_chan.clone(),
+            mem_profiler_chan: mem_profiler_chan.clone(),
+            rendering_context: builder.rendering_context,
             shutdown_state: shutdown_state.clone(),
             event_loop_waker,
             refresh_driver: builder.refresh_driver,
+            shaders_path: opts.shaders_path.clone(),
+            #[cfg(feature = "webxr")]
+            webxr_registry: builder.webxr_registry,
         });
 
-        let constellation_proxy = ConstellationProxy::new(constellation_chan);
+        create_constellation(
+            embedder_to_constellation_receiver,
+            &compositor.borrow(),
+            opts.config_dir.clone(),
+            embedder_proxy,
+            compositor_proxy.clone(),
+            time_profiler_chan,
+            mem_profiler_chan,
+            devtools_sender,
+            protocols,
+            builder.user_content_manager,
+        );
+
+        if opts::get().multiprocess {
+            prefs::add_observer(Box::new(constellation_proxy.clone()));
+        }
+
         Self {
             delegate: RefCell::new(Rc::new(DefaultServoDelegate)),
-            compositor: Rc::new(RefCell::new(compositor)),
+            compositor,
             javascript_evaluator: Rc::new(RefCell::new(JavaScriptEvaluator::new(
                 constellation_proxy.clone(),
             ))),
@@ -537,7 +363,7 @@ impl Servo {
         }
 
         {
-            let mut compositor = self.compositor.borrow_mut();
+            let compositor = self.compositor.borrow();
             let mut messages = Vec::new();
             while let Ok(message) = compositor.receiver().try_recv() {
                 match message {
@@ -578,15 +404,11 @@ impl Servo {
     }
 
     fn send_new_frame_ready_messages(&self) {
-        if !self.compositor.borrow().needs_repaint() {
-            return;
-        }
+        let webviews_needing_repaint = self.compositor.borrow().webviews_needing_repaint();
 
-        for webview in self
-            .webviews
-            .borrow()
-            .values()
-            .filter_map(WebView::from_weak_handle)
+        for webview in webviews_needing_repaint
+            .iter()
+            .filter_map(|webview_id| self.get_webview_handle(*webview_id))
         {
             webview.delegate().notify_new_frame_ready(webview);
         }
@@ -693,11 +515,12 @@ impl Servo {
                         .request_resize_to(webview, size.max(MINIMUM_WEBVIEW_SIZE));
                 }
             },
-            EmbedderMsg::ShowSimpleDialog(webview_id, prompt_definition) => {
+            EmbedderMsg::ShowSimpleDialog(webview_id, simple_dialog) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
-                    webview
-                        .delegate()
-                        .show_simple_dialog(webview, prompt_definition);
+                    webview.delegate().show_embedder_control(
+                        webview,
+                        EmbedderControl::SimpleDialog(simple_dialog),
+                    );
                 }
             },
             EmbedderMsg::ShowContextMenu(webview_id, ipc_sender, title, items) => {
@@ -920,22 +743,6 @@ impl Servo {
                         .request_permission(webview, permission_request);
                 }
             },
-            EmbedderMsg::ShowIME(webview_id, input_method_type, text, multiline, position) => {
-                if let Some(webview) = self.get_webview_handle(webview_id) {
-                    webview.delegate().show_ime(
-                        webview,
-                        input_method_type,
-                        text,
-                        multiline,
-                        position,
-                    );
-                }
-            },
-            EmbedderMsg::HideIME(webview_id) => {
-                if let Some(webview) = self.get_webview_handle(webview_id) {
-                    webview.delegate().hide_ime(webview);
-                }
-            },
             EmbedderMsg::ReportProfile(_items) => {},
             EmbedderMsg::MediaSessionEvent(webview_id, media_session_event) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
@@ -1013,6 +820,16 @@ impl Servo {
                                 position,
                                 constellation_proxy,
                                 response_sent: false,
+                            })
+                        },
+                        EmbedderControlRequest::InputMethod(input_method_request) => {
+                            EmbedderControl::InputMethod(InputMethodControl {
+                                id: control_id,
+                                input_method_type: input_method_request.input_method_type,
+                                text: input_method_request.text,
+                                insertion_point: input_method_request.insertion_point,
+                                position,
+                                multiline: input_method_request.multiline,
                             })
                         },
                         EmbedderControlRequest::FilePicker { .. } => unreachable!(
@@ -1134,21 +951,17 @@ fn create_compositor_channel(
 
 #[allow(clippy::too_many_arguments)]
 fn create_constellation(
+    embedder_to_constellation_receiver: Receiver<EmbedderToConstellationMessage>,
+    compositor: &IOCompositor,
     config_dir: Option<PathBuf>,
     embedder_proxy: EmbedderProxy,
     compositor_proxy: CompositorProxy,
     time_profiler_chan: time::ProfilerChan,
     mem_profiler_chan: mem::ProfilerChan,
     devtools_sender: Option<Sender<devtools_traits::DevtoolsControlMsg>>,
-    webrender_document: DocumentId,
-    webrender_api_sender: RenderApiSender,
-    #[cfg(feature = "webxr")] webxr_registry: webxr_api::Registry,
-    webgl_threads: Option<WebGLThreads>,
-    external_images: Arc<Mutex<WebrenderExternalImageRegistry>>,
-    #[cfg(feature = "webgpu")] wgpu_image_map: WGPUImageMap,
     protocols: ProtocolRegistry,
     user_content_manager: UserContentManager,
-) -> Sender<EmbedderToConstellationMessage> {
+) {
     // Global configuration options, parsed from the command line.
     let opts = opts::get();
 
@@ -1193,16 +1006,14 @@ fn create_constellation(
         private_storage_threads,
         time_profiler_chan,
         mem_profiler_chan,
-        webrender_document,
-        webrender_api_sender,
         #[cfg(feature = "webxr")]
-        webxr_registry: Some(webxr_registry),
+        webxr_registry: Some(compositor.webxr_main_thread_registry()),
         #[cfg(not(feature = "webxr"))]
         webxr_registry: None,
-        webgl_threads,
-        webrender_external_images: external_images,
+        webgl_threads: Some(compositor.webgl_threads()),
+        webrender_external_images: compositor.webrender_external_images(),
         #[cfg(feature = "webgpu")]
-        wgpu_image_map,
+        wgpu_image_map: compositor.webgpu_image_map(),
         user_content_manager,
         async_runtime,
         privileged_urls,
@@ -1211,12 +1022,13 @@ fn create_constellation(
     let layout_factory = Arc::new(LayoutFactoryImpl());
 
     Constellation::<script::ScriptThread, script::ServiceWorkerManager>::start(
+        embedder_to_constellation_receiver,
         initial_state,
         layout_factory,
         opts.random_pipeline_closure_probability,
         opts.random_pipeline_closure_seed,
         opts.hard_fail,
-    )
+    );
 }
 
 // A logger that logs to two downstream loggers.

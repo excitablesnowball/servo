@@ -12,12 +12,12 @@ use std::path::PathBuf;
 
 use base::id::{
     BlobId, DomExceptionId, DomMatrixId, DomPointId, DomQuadId, DomRectId, ImageBitmapId,
-    QuotaExceededErrorId,
+    ImageDataId, QuotaExceededErrorId,
 };
 use euclid::default::Transform3D;
 use malloc_size_of_derive::MallocSizeOf;
 use net_traits::filemanager_thread::RelativePos;
-use pixels::Snapshot;
+use pixels::SharedSnapshot;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use servo_url::ImmutableOrigin;
@@ -69,6 +69,8 @@ pub enum Serializable {
     DomException,
     /// The `ImageBitmap` interface.
     ImageBitmap,
+    /// The `ImageData` interface.
+    ImageData,
 }
 
 impl Serializable {
@@ -96,6 +98,9 @@ impl Serializable {
             },
             Serializable::QuotaExceededError => {
                 StructuredSerializedData::clone_all_of_type::<SerializableQuotaExceededError>
+            },
+            Serializable::ImageData => {
+                StructuredSerializedData::clone_all_of_type::<SerializableImageData>
             },
         }
     }
@@ -446,7 +451,7 @@ impl BroadcastClone for SerializableQuotaExceededError {
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 /// A serializable version of the ImageBitmap interface.
 pub struct SerializableImageBitmap {
-    pub bitmap_data: Snapshot,
+    pub bitmap_data: SharedSnapshot,
 }
 
 impl BroadcastClone for SerializableImageBitmap {
@@ -458,6 +463,29 @@ impl BroadcastClone for SerializableImageBitmap {
 
     fn destination(data: &mut StructuredSerializedData) -> &mut Option<FxHashMap<Self::Id, Self>> {
         &mut data.image_bitmaps
+    }
+
+    fn clone_for_broadcast(&self) -> Option<Self> {
+        Some(self.clone())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct SerializableImageData {
+    pub data: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl BroadcastClone for SerializableImageData {
+    type Id = ImageDataId;
+
+    fn source(data: &StructuredSerializedData) -> &Option<FxHashMap<Self::Id, Self>> {
+        &data.image_data
+    }
+
+    fn destination(data: &mut StructuredSerializedData) -> &mut Option<FxHashMap<Self::Id, Self>> {
+        &mut data.image_data
     }
 
     fn clone_for_broadcast(&self) -> Option<Self> {

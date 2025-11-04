@@ -8,7 +8,7 @@ use std::collections::hash_map::Entry;
 use std::mem;
 use std::rc::Rc;
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::Receiver;
 use image::{DynamicImage, ImageFormat};
 use log::{error, info};
 use servo::base::generic_channel::GenericSender;
@@ -18,10 +18,10 @@ use servo::ipc_channel::ipc::IpcSender;
 use servo::webrender_api::units::{DeviceIntPoint, DeviceIntSize};
 use servo::{
     AllowOrDenyRequest, AuthenticationRequest, EmbedderControl, EmbedderControlId,
-    GamepadHapticEffectType, InputEvent, InputEventId, InputEventResult, JSValue, LoadStatus,
+    GamepadHapticEffectType, InputEventId, InputEventResult, JSValue, LoadStatus,
     PermissionRequest, Servo, ServoDelegate, ServoError, SimpleDialog, TraversalId,
-    WebDriverCommandMsg, WebDriverJSResult, WebDriverLoadStatus, WebDriverSenders,
-    WebDriverUserPrompt, WebView, WebViewBuilder, WebViewDelegate,
+    WebDriverCommandMsg, WebDriverLoadStatus, WebDriverUserPrompt, WebView, WebViewBuilder,
+    WebViewDelegate,
 };
 use url::Url;
 
@@ -30,6 +30,7 @@ use super::dialog::Dialog;
 use super::gamepad::GamepadSupport;
 use super::window_trait::WindowPortsMethods;
 use crate::prefs::ServoShellPreferences;
+use crate::running_app_state::{RunningAppStateBase, RunningAppStateTrait};
 
 pub(crate) enum AppState {
     Initializing,
@@ -38,17 +39,10 @@ pub(crate) enum AppState {
 }
 
 pub(crate) struct RunningAppState {
-    /// A handle to the Servo instance of the [`RunningAppState`]. This is not stored inside
-    /// `inner` so that we can keep a reference to Servo in order to spin the event loop,
-    /// which will in turn call delegates doing a mutable borrow on `inner`.
-    servo: Servo,
-    /// The preferences for this run of servoshell. This is not mutable, so doesn't need to
-    /// be stored inside the [`RunningAppStateInner`].
-    servoshell_preferences: ServoShellPreferences,
+    base: RunningAppStateBase,
     /// A [`Receiver`] for receiving commands from a running WebDriver server, if WebDriver
     /// was enabled.
     webdriver_receiver: Option<Receiver<WebDriverCommandMsg>>,
-    webdriver_senders: RefCell<WebDriverSenders>,
     inner: RefCell<RunningAppStateInner>,
 }
 
@@ -93,15 +87,27 @@ pub struct RunningAppStateInner {
     /// for the `exit_after_stable_image` option.
     achieved_stable_image: Rc<Cell<bool>>,
 
-    /// A [`HashMap`] of pending WebDriver events. It is the WebDriver embedder's responsibility
-    /// to inform the WebDriver server when the event has been fully handled. This map is used
-    /// to report back to WebDriver when that happens.
-    pending_webdriver_events: HashMap<InputEventId, Sender<()>>,
+    /// A list of showing [`InputMethod`] interfaces.
+    visible_input_methods: Vec<EmbedderControlId>,
 }
 
 impl Drop for RunningAppState {
     fn drop(&mut self) {
-        self.servo.deinit();
+        self.servo().deinit();
+    }
+}
+
+impl RunningAppStateTrait for RunningAppState {
+    fn base(&self) -> &RunningAppStateBase {
+        &self.base
+    }
+
+    fn base_mut(&mut self) -> &mut RunningAppStateBase {
+        &mut self.base
+    }
+
+    fn webview_by_id(&self, id: WebViewId) -> Option<WebView> {
+        self.inner().webviews.get(&id).cloned()
     }
 }
 
@@ -119,10 +125,8 @@ impl RunningAppState {
             None
         };
         RunningAppState {
-            servo,
-            servoshell_preferences,
+            base: RunningAppStateBase::new(servoshell_preferences, servo),
             webdriver_receiver,
-            webdriver_senders: RefCell::default(),
             inner: RefCell::new(RunningAppStateInner {
                 webviews: HashMap::default(),
                 creation_order: Default::default(),
@@ -135,7 +139,7 @@ impl RunningAppState {
                 dialog_amount_changed: false,
                 pending_favicon_loads: Default::default(),
                 achieved_stable_image: Default::default(),
-                pending_webdriver_events: Default::default(),
+                visible_input_methods: Default::default(),
             }),
         }
     }
@@ -163,10 +167,6 @@ impl RunningAppState {
 
     pub(crate) fn inner_mut(&self) -> RefMut<'_, RunningAppStateInner> {
         self.inner.borrow_mut()
-    }
-
-    pub(crate) fn servo(&self) -> &Servo {
-        &self.servo
     }
 
     pub(crate) fn webdriver_receiver(&self) -> Option<&Receiver<WebDriverCommandMsg>> {
@@ -221,10 +221,10 @@ impl RunningAppState {
 
         self.inner_mut().dialog_amount_changed = false;
 
-        if self.servoshell_preferences.exit_after_stable_image &&
+        if self.servoshell_preferences().exit_after_stable_image &&
             self.inner().achieved_stable_image.get()
         {
-            self.servo.start_shutting_down();
+            self.servo().start_shutting_down();
         }
 
         PumpResult::Continue {
@@ -287,8 +287,8 @@ impl RunningAppState {
             Some(last_created_webview) => {
                 last_created_webview.focus();
             },
-            None if self.servoshell_preferences.webdriver_port.is_none() => {
-                self.servo.start_shutting_down()
+            None if self.servoshell_preferences().webdriver_port.is_none() => {
+                self.servo().start_shutting_down()
             },
             None => {
                 // For WebDriver, don't shut down when last webview closed
@@ -311,10 +311,6 @@ impl RunningAppState {
             .iter()
             .map(|id| (*id, inner.webviews.get(id).unwrap().clone()))
             .collect()
-    }
-
-    pub fn webview_by_id(&self, id: WebViewId) -> Option<WebView> {
-        self.inner().webviews.get(&id).cloned()
     }
 
     pub fn handle_gamepad_events(&self) {
@@ -394,16 +390,6 @@ impl RunningAppState {
         }
     }
 
-    pub(crate) fn dismiss_active_dialogs_with_control_id(
-        &self,
-        webview_id: WebViewId,
-        control_id: EmbedderControlId,
-    ) {
-        if let Some(dialogs) = self.inner_mut().dialogs.get_mut(&webview_id) {
-            dialogs.retain(|dialog| dialog.embedder_control_id() != Some(control_id));
-        }
-    }
-
     pub(crate) fn alert_text_of_newest_dialog(&self, webview_id: WebViewId) -> Option<String> {
         self.inner()
             .dialogs
@@ -420,42 +406,48 @@ impl RunningAppState {
         }
     }
 
+    fn show_simple_dialog(&self, webview: servo::WebView, dialog: SimpleDialog) {
+        self.interrupt_webdriver_script_evaluation();
+
+        // Dialogs block the page load, so need need to notify WebDriver
+        let webview_id = webview.id();
+        if let Some(sender) = self
+            .base()
+            .webdriver_senders
+            .borrow_mut()
+            .load_status_senders
+            .get(&webview_id)
+        {
+            let _ = sender.send(WebDriverLoadStatus::Blocked);
+        };
+
+        if self.servoshell_preferences().headless &&
+            self.servoshell_preferences().webdriver_port.is_none()
+        {
+            // TODO: Avoid copying this from the default trait impl?
+            // Return the DOM-specified default value for when we **cannot show simple dialogs**.
+            let _ = match dialog {
+                SimpleDialog::Alert {
+                    response_sender, ..
+                } => response_sender.send(Default::default()),
+                SimpleDialog::Confirm {
+                    response_sender, ..
+                } => response_sender.send(Default::default()),
+                SimpleDialog::Prompt {
+                    response_sender, ..
+                } => response_sender.send(Default::default()),
+            };
+            return;
+        }
+        let dialog = Dialog::new_simple_dialog(dialog);
+        self.add_dialog(webview, dialog);
+    }
+
     pub(crate) fn get_focused_webview_index(&self) -> Option<usize> {
         let focused_id = self.inner().focused_webview_id?;
         self.webviews()
             .iter()
             .position(|webview| webview.0 == focused_id)
-    }
-
-    pub(crate) fn set_pending_traversal(
-        &self,
-        traversal_id: TraversalId,
-        sender: GenericSender<WebDriverLoadStatus>,
-    ) {
-        self.webdriver_senders
-            .borrow_mut()
-            .pending_traversals
-            .insert(traversal_id, sender);
-    }
-
-    pub(crate) fn set_load_status_sender(
-        &self,
-        webview_id: WebViewId,
-        sender: GenericSender<WebDriverLoadStatus>,
-    ) {
-        self.webdriver_senders
-            .borrow_mut()
-            .load_status_senders
-            .insert(webview_id, sender);
-    }
-
-    pub(crate) fn set_script_command_interrupt_sender(
-        &self,
-        sender: Option<IpcSender<WebDriverJSResult>>,
-    ) {
-        self.webdriver_senders
-            .borrow_mut()
-            .script_evaluation_interrupt_sender = sender;
     }
 
     /// Interrupt any ongoing WebDriver-based script evaluation.
@@ -469,6 +461,7 @@ impl RunningAppState {
     /// >  other steps of this algorithm in parallel.
     fn interrupt_webdriver_script_evaluation(&self) {
         if let Some(sender) = &self
+            .base()
             .webdriver_senders
             .borrow()
             .script_evaluation_interrupt_sender
@@ -481,13 +474,6 @@ impl RunningAppState {
         }
     }
 
-    pub(crate) fn remove_load_status_sender(&self, webview_id: WebViewId) {
-        self.webdriver_senders
-            .borrow_mut()
-            .load_status_senders
-            .remove(&webview_id);
-    }
-
     /// Return a list of all webviews that have favicons that have not yet been loaded by egui.
     pub(crate) fn take_pending_favicon_loads(&self) -> Vec<WebViewId> {
         mem::take(&mut self.inner_mut().pending_favicon_loads)
@@ -496,8 +482,8 @@ impl RunningAppState {
     /// If we are exiting after achieving a stable image or we want to save the display of the
     /// [`WebView`] to an image file, request a screenshot of the [`WebView`].
     fn maybe_request_screenshot(&self, webview: WebView) {
-        let output_path = self.servoshell_preferences.output_image_path.clone();
-        if !self.servoshell_preferences.exit_after_stable_image && output_path.is_none() {
+        let output_path = self.servoshell_preferences().output_image_path.clone();
+        if !self.servoshell_preferences().exit_after_stable_image && output_path.is_none() {
             return;
         }
 
@@ -529,26 +515,6 @@ impl RunningAppState {
                 error!("Failed to save screenshot: {error}.");
             }
         });
-    }
-
-    pub(crate) fn handle_webdriver_input_event(
-        &self,
-        webview_id: WebViewId,
-        input_event: InputEvent,
-        response_sender: Option<Sender<()>>,
-    ) {
-        let Some(webview) = self.webview_by_id(webview_id) else {
-            error!("Could not find WebView ({webview_id:?}) for WebDriver event: {input_event:?}");
-            return;
-        };
-
-        let event_id = webview.notify_input_event(input_event);
-
-        if let Some(response_sender) = response_sender {
-            self.inner_mut()
-                .pending_webdriver_events
-                .insert(event_id, response_sender);
-        }
     }
 }
 
@@ -589,7 +555,7 @@ impl WebViewDelegate for RunningAppState {
     }
 
     fn notify_traversal_complete(&self, _webview: servo::WebView, traversal_id: TraversalId) {
-        let mut webdriver_state = self.webdriver_senders.borrow_mut();
+        let mut webdriver_state = self.base().webdriver_senders.borrow_mut();
         if let Entry::Occupied(entry) = webdriver_state.pending_traversals.entry(traversal_id) {
             let sender = entry.remove();
             let _ = sender.send(WebDriverLoadStatus::Complete);
@@ -607,49 +573,13 @@ impl WebViewDelegate for RunningAppState {
             .request_resize(&webview, requested_outer_size);
     }
 
-    fn show_simple_dialog(&self, webview: servo::WebView, dialog: SimpleDialog) {
-        self.interrupt_webdriver_script_evaluation();
-
-        // Dialogs block the page load, so need need to notify WebDriver
-        let webview_id = webview.id();
-        if let Some(sender) = self
-            .webdriver_senders
-            .borrow_mut()
-            .load_status_senders
-            .get(&webview_id)
-        {
-            let _ = sender.send(WebDriverLoadStatus::Blocked);
-        };
-
-        if self.servoshell_preferences.headless &&
-            self.servoshell_preferences.webdriver_port.is_none()
-        {
-            // TODO: Avoid copying this from the default trait impl?
-            // Return the DOM-specified default value for when we **cannot show simple dialogs**.
-            let _ = match dialog {
-                SimpleDialog::Alert {
-                    response_sender, ..
-                } => response_sender.send(Default::default()),
-                SimpleDialog::Confirm {
-                    response_sender, ..
-                } => response_sender.send(Default::default()),
-                SimpleDialog::Prompt {
-                    response_sender, ..
-                } => response_sender.send(Default::default()),
-            };
-            return;
-        }
-        let dialog = Dialog::new_simple_dialog(dialog);
-        self.add_dialog(webview, dialog);
-    }
-
     fn request_authentication(
         &self,
         webview: WebView,
         authentication_request: AuthenticationRequest,
     ) {
-        if self.servoshell_preferences.headless &&
-            self.servoshell_preferences.webdriver_port.is_none()
+        if self.servoshell_preferences().headless &&
+            self.servoshell_preferences().webdriver_port.is_none()
         {
             return;
         }
@@ -664,7 +594,7 @@ impl WebViewDelegate for RunningAppState {
         &self,
         parent_webview: servo::WebView,
     ) -> Option<servo::WebView> {
-        let webview = WebViewBuilder::new_auxiliary(&self.servo)
+        let webview = WebViewBuilder::new_auxiliary(self.servo())
             .hidpi_scale_factor(self.inner().window.hidpi_scale_factor())
             .delegate(parent_webview.delegate())
             .build();
@@ -673,7 +603,7 @@ impl WebViewDelegate for RunningAppState {
         // When WebDriver is enabled, do not focus and raise the WebView to the top,
         // as that is what the specification expects. Otherwise, we would like `window.open()`
         // to create a new foreground tab
-        if self.servoshell_preferences.webdriver_port.is_none() {
+        if self.servoshell_preferences().webdriver_port.is_none() {
             webview.focus_and_raise_to_top(true);
         }
         self.add(webview.clone());
@@ -705,7 +635,12 @@ impl WebViewDelegate for RunningAppState {
             .window
             .notify_input_event_handled(&webview, id, result);
 
-        if let Some(response_sender) = self.inner_mut().pending_webdriver_events.remove(&id) {
+        if let Some(response_sender) = self
+            .base()
+            .pending_webdriver_events
+            .borrow_mut()
+            .remove(&id)
+        {
             let _ = response_sender.send(());
         }
     }
@@ -719,6 +654,7 @@ impl WebViewDelegate for RunningAppState {
 
         if status == LoadStatus::Complete {
             if let Some(sender) = self
+                .base()
                 .webdriver_senders
                 .borrow_mut()
                 .load_status_senders
@@ -747,8 +683,8 @@ impl WebViewDelegate for RunningAppState {
     }
 
     fn request_permission(&self, webview: servo::WebView, permission_request: PermissionRequest) {
-        if self.servoshell_preferences.headless &&
-            self.servoshell_preferences.webdriver_port.is_none()
+        if self.servoshell_preferences().headless &&
+            self.servoshell_preferences().webdriver_port.is_none()
         {
             permission_request.deny();
             return;
@@ -791,30 +727,15 @@ impl WebViewDelegate for RunningAppState {
         };
         let _ = haptic_stop_sender.send(stopped);
     }
-    fn show_ime(
-        &self,
-        _webview: WebView,
-        input_type: servo::InputMethodType,
-        text: Option<(String, i32)>,
-        multiline: bool,
-        position: servo::webrender_api::units::DeviceIntRect,
-    ) {
-        self.inner()
-            .window
-            .show_ime(input_type, text, multiline, position);
-    }
-
-    fn hide_ime(&self, _webview: WebView) {
-        self.inner().window.hide_ime();
-    }
 
     fn show_embedder_control(&self, webview: WebView, embedder_control: EmbedderControl) {
-        if self.servoshell_preferences.headless &&
-            self.servoshell_preferences.webdriver_port.is_none()
+        if self.servoshell_preferences().headless &&
+            self.servoshell_preferences().webdriver_port.is_none()
         {
             return;
         }
 
+        let control_id = embedder_control.id();
         match embedder_control {
             EmbedderControl::SelectElement(prompt) => {
                 // FIXME: Reading the toolbar height is needed here to properly position the select dialog.
@@ -831,14 +752,35 @@ impl WebViewDelegate for RunningAppState {
                     Dialog::new_color_picker_dialog(color_picker, offset),
                 );
             },
+            EmbedderControl::InputMethod(input_method_control) => {
+                self.inner_mut().visible_input_methods.push(control_id);
+                self.inner().window.show_ime(input_method_control);
+            },
             EmbedderControl::FilePicker(file_picker) => {
                 self.add_dialog(webview, Dialog::new_file_dialog(file_picker));
+            },
+            EmbedderControl::SimpleDialog(simple_dialog) => {
+                self.show_simple_dialog(webview, simple_dialog);
             },
         }
     }
 
-    fn hide_embedder_control(&self, webview: WebView, control_id: servo::EmbedderControlId) {
-        self.dismiss_active_dialogs_with_control_id(webview.id(), control_id);
+    fn hide_embedder_control(&self, webview: WebView, control_id: EmbedderControlId) {
+        {
+            let mut inner_mut = self.inner_mut();
+            if let Some(index) = inner_mut
+                .visible_input_methods
+                .iter()
+                .position(|visible_id| *visible_id == control_id)
+            {
+                inner_mut.visible_input_methods.remove(index);
+                inner_mut.window.hide_ime();
+            }
+        }
+
+        if let Some(dialogs) = self.inner_mut().dialogs.get_mut(&webview.id()) {
+            dialogs.retain(|dialog| dialog.embedder_control_id() != Some(control_id));
+        }
     }
 
     fn notify_favicon_changed(&self, webview: WebView) {

@@ -7,7 +7,7 @@
 use std::fmt::{Debug, Error, Formatter};
 
 use base::Epoch;
-use base::id::{PipelineId, RenderingGroupId, WebViewId};
+use base::id::{PainterId, PipelineId, WebViewId};
 use crossbeam_channel::Sender;
 use embedder_traits::{AnimationState, EventLoopWaker};
 use log::warn;
@@ -18,6 +18,7 @@ use strum_macros::IntoStaticStr;
 use webrender_api::{DocumentId, FontVariation};
 
 pub mod display_list;
+pub mod largest_contentful_paint_candidate;
 pub mod rendering_context;
 pub mod viewport_description;
 
@@ -40,6 +41,7 @@ use webrender_api::{
     PipelineId as WebRenderPipelineId,
 };
 
+use crate::largest_contentful_paint_candidate::LCPCandidate;
 use crate::viewport_description::ViewportDescription;
 
 /// Sends messages to the compositor.
@@ -88,9 +90,9 @@ pub enum CompositorMsg {
     /// Set whether to use less resources by stopping animations.
     SetThrottled(WebViewId, PipelineId, bool),
     /// WebRender has produced a new frame. This message informs the compositor that
-    /// the frame is ready. It contains a bool to indicate if it needs to composite and the
-    /// `DocumentId` of the new frame.
-    NewWebRenderFrameReady(DocumentId, bool),
+    /// the frame is ready. It contains a bool to indicate if it needs to composite, the
+    /// `DocumentId` of the new frame and the `PainterId` of the associated painter.
+    NewWebRenderFrameReady(PainterId, DocumentId, bool),
     /// Script or the Constellation is notifying the renderer that a Pipeline has finished
     /// shutting down. The renderer will not discard the Pipeline until both report that
     /// they have fully shut it down, to avoid recreating it due to any subsequent
@@ -98,13 +100,19 @@ pub enum CompositorMsg {
     PipelineExited(WebViewId, PipelineId, PipelineExitSource),
     /// Inform WebRender of the existence of this pipeline.
     SendInitialTransaction(WebViewId, WebRenderPipelineId),
-    /// Perform a scroll operation.
-    SendScrollNode(
+    /// Scroll the given node ([`ExternalScrollId`]) by the provided delta. This
+    /// will only adjust the node's scroll position and will *not* do panning in
+    /// the pinch zoom viewport.
+    ScrollNodeByDelta(
         WebViewId,
         WebRenderPipelineId,
         LayoutVector2D,
         ExternalScrollId,
     ),
+    /// Scroll the WebView's viewport by the given delta. This will also do panning
+    /// in the pinch zoom viewport if possible and the remaining delta will be used
+    /// to scroll the root layer.
+    ScrollViewportByDelta(WebViewId, LayoutVector2D),
     /// Update the rendering epoch of the given `Pipeline`.
     UpdateEpoch {
         /// The [`WebViewId`] that this display list belongs to.
@@ -146,7 +154,7 @@ pub enum CompositorMsg {
         usize,
         usize,
         GenericSender<(Vec<FontKey>, Vec<FontInstanceKey>)>,
-        RenderingGroupId,
+        PainterId,
     ),
     /// Add a font with the given data and font key.
     AddFont(FontKey, Arc<IpcSharedMemory>, u32),
@@ -170,6 +178,8 @@ pub enum CompositorMsg {
     /// Let the compositor know that the given WebView is ready to have a screenshot taken
     /// after the given pipeline's epochs have been rendered.
     ScreenshotReadinessReponse(WebViewId, FxHashMap<PipelineId, Epoch>),
+    /// The candidate of largest-contentful-paint
+    SendLCPCandidate(LCPCandidate, WebViewId, PipelineId, Epoch),
 }
 
 impl Debug for CompositorMsg {
@@ -219,21 +229,38 @@ impl CrossProcessCompositorApi {
         }
     }
 
-    /// Perform a scroll operation.
-    pub fn send_scroll_node(
+    /// Scroll the given node ([`ExternalScrollId`]) by the provided delta. This
+    /// will only adjust the node's scroll position and will *not* do panning in
+    /// the pinch zoom viewport.
+    pub fn scroll_node_by_delta(
         &self,
         webview_id: WebViewId,
         pipeline_id: WebRenderPipelineId,
-        point: LayoutVector2D,
+        delta: LayoutVector2D,
         scroll_id: ExternalScrollId,
     ) {
-        if let Err(e) = self.0.send(CompositorMsg::SendScrollNode(
+        if let Err(error) = self.0.send(CompositorMsg::ScrollNodeByDelta(
             webview_id,
             pipeline_id,
-            point,
+            delta,
             scroll_id,
         )) {
-            warn!("Error sending scroll node: {}", e);
+            warn!("Error scrolling node: {error}");
+        }
+    }
+
+    /// Scroll the WebView's viewport by the given delta. This will also do panning
+    /// in the pinch zoom viewport if possible and the remaining delta will be used
+    /// to scroll the root layer.
+    ///
+    /// Note the value provided here is in `DeviceIndependentPixels` and will first be
+    /// converted to `DevicePixels` by the renderer.
+    pub fn scroll_viewport_by_delta(&self, webview_id: WebViewId, delta: LayoutVector2D) {
+        if let Err(error) = self
+            .0
+            .send(CompositorMsg::ScrollViewportByDelta(webview_id, delta))
+        {
+            warn!("Error scroll viewport: {error}");
         }
     }
 
@@ -295,6 +322,24 @@ impl CrossProcessCompositorApi {
         }
         if let Err(error) = display_list_sender.send(&display_list_data.spatial_tree) {
             warn!("Error sending display spatial tree: {error}");
+        }
+    }
+
+    /// Send the largest contentful paint candidate to the compositor.
+    pub fn send_lcp_candidate(
+        &self,
+        lcp_candidate: LCPCandidate,
+        webview_id: WebViewId,
+        pipeline_id: PipelineId,
+        epoch: Epoch,
+    ) {
+        if let Err(error) = self.0.send(CompositorMsg::SendLCPCandidate(
+            lcp_candidate,
+            webview_id,
+            pipeline_id,
+            epoch,
+        )) {
+            warn!("Error sending LCPCandidate: {error}");
         }
     }
 
@@ -394,14 +439,14 @@ impl CrossProcessCompositorApi {
         &self,
         number_of_font_keys: usize,
         number_of_font_instance_keys: usize,
-        rendering_group_id: RenderingGroupId,
+        painter_id: PainterId,
     ) -> (Vec<FontKey>, Vec<FontInstanceKey>) {
         let (sender, receiver) = generic_channel::channel().expect("Could not create IPC channel");
         let _ = self.0.send(CompositorMsg::GenerateFontKeys(
             number_of_font_keys,
             number_of_font_instance_keys,
             sender,
-            rendering_group_id,
+            painter_id,
         ));
         receiver.recv().unwrap()
     }
@@ -432,31 +477,31 @@ impl CrossProcessCompositorApi {
 //
 /// This trait is used to notify lock/unlock messages and get the
 /// required info that WR needs.
-pub trait WebrenderExternalImageApi {
+pub trait WebRenderExternalImageApi {
     fn lock(&mut self, id: u64) -> (ExternalImageSource<'_>, UntypedSize2D<i32>);
     fn unlock(&mut self, id: u64);
 }
 
-/// Type of Webrender External Image Handler.
-pub enum WebrenderImageHandlerType {
-    WebGL,
+/// Type of WebRender External Image Handler.
+pub enum WebRenderImageHandlerType {
+    WebGl,
     Media,
-    WebGPU,
+    WebGpu,
 }
 
-/// List of Webrender external images to be shared among all external image
+/// List of WebRender external images to be shared among all external image
 /// consumers (WebGL, Media, WebGPU).
 /// It ensures that external image identifiers are unique.
 #[derive(Default)]
-pub struct WebrenderExternalImageRegistry {
+pub struct WebRenderExternalImageRegistry {
     /// Map of all generated external images.
-    external_images: FxHashMap<ExternalImageId, WebrenderImageHandlerType>,
+    external_images: FxHashMap<ExternalImageId, WebRenderImageHandlerType>,
     /// Id generator for the next external image identifier.
     next_image_id: u64,
 }
 
-impl WebrenderExternalImageRegistry {
-    pub fn next_id(&mut self, handler_type: WebrenderImageHandlerType) -> ExternalImageId {
+impl WebRenderExternalImageRegistry {
+    pub fn next_id(&mut self, handler_type: WebRenderImageHandlerType) -> ExternalImageId {
         self.next_image_id += 1;
         let key = ExternalImageId(self.next_image_id);
         self.external_images.insert(key, handler_type);
@@ -467,26 +512,26 @@ impl WebrenderExternalImageRegistry {
         self.external_images.remove(key);
     }
 
-    pub fn get(&self, key: &ExternalImageId) -> Option<&WebrenderImageHandlerType> {
+    pub fn get(&self, key: &ExternalImageId) -> Option<&WebRenderImageHandlerType> {
         self.external_images.get(key)
     }
 }
 
 /// WebRender External Image Handler implementation.
-pub struct WebrenderExternalImageHandlers {
+pub struct WebRenderExternalImageHandlers {
     /// WebGL handler.
-    webgl_handler: Option<Box<dyn WebrenderExternalImageApi>>,
+    webgl_handler: Option<Box<dyn WebRenderExternalImageApi>>,
     /// Media player handler.
-    media_handler: Option<Box<dyn WebrenderExternalImageApi>>,
+    media_handler: Option<Box<dyn WebRenderExternalImageApi>>,
     /// WebGPU handler.
-    webgpu_handler: Option<Box<dyn WebrenderExternalImageApi>>,
-    /// Webrender external images.
-    external_images: Arc<Mutex<WebrenderExternalImageRegistry>>,
+    webgpu_handler: Option<Box<dyn WebRenderExternalImageApi>>,
+    /// WebRender external images.
+    external_images: Arc<Mutex<WebRenderExternalImageRegistry>>,
 }
 
-impl WebrenderExternalImageHandlers {
-    pub fn new() -> (Self, Arc<Mutex<WebrenderExternalImageRegistry>>) {
-        let external_images = Arc::new(Mutex::new(WebrenderExternalImageRegistry::default()));
+impl WebRenderExternalImageHandlers {
+    pub fn new() -> (Self, Arc<Mutex<WebRenderExternalImageRegistry>>) {
+        let external_images = Arc::new(Mutex::new(WebRenderExternalImageRegistry::default()));
         (
             Self {
                 webgl_handler: None,
@@ -500,18 +545,18 @@ impl WebrenderExternalImageHandlers {
 
     pub fn set_handler(
         &mut self,
-        handler: Box<dyn WebrenderExternalImageApi>,
-        handler_type: WebrenderImageHandlerType,
+        handler: Box<dyn WebRenderExternalImageApi>,
+        handler_type: WebRenderImageHandlerType,
     ) {
         match handler_type {
-            WebrenderImageHandlerType::WebGL => self.webgl_handler = Some(handler),
-            WebrenderImageHandlerType::Media => self.media_handler = Some(handler),
-            WebrenderImageHandlerType::WebGPU => self.webgpu_handler = Some(handler),
+            WebRenderImageHandlerType::WebGl => self.webgl_handler = Some(handler),
+            WebRenderImageHandlerType::Media => self.media_handler = Some(handler),
+            WebRenderImageHandlerType::WebGpu => self.webgpu_handler = Some(handler),
         }
     }
 }
 
-impl ExternalImageHandler for WebrenderExternalImageHandlers {
+impl ExternalImageHandler for WebRenderExternalImageHandlers {
     /// Lock the external image. Then, WR could start to read the
     /// image content.
     /// The WR client should not change the image content until the
@@ -527,7 +572,7 @@ impl ExternalImageHandler for WebrenderExternalImageHandlers {
             .get(&key)
             .expect("Tried to get unknown external image");
         match handler_type {
-            WebrenderImageHandlerType::WebGL => {
+            WebRenderImageHandlerType::WebGl => {
                 let (source, size) = self.webgl_handler.as_mut().unwrap().lock(key.0);
                 let texture_id = match source {
                     ExternalImageSource::NativeTexture(b) => b,
@@ -538,7 +583,7 @@ impl ExternalImageHandler for WebrenderExternalImageHandlers {
                     source: ExternalImageSource::NativeTexture(texture_id),
                 }
             },
-            WebrenderImageHandlerType::Media => {
+            WebRenderImageHandlerType::Media => {
                 let (source, size) = self.media_handler.as_mut().unwrap().lock(key.0);
                 let texture_id = match source {
                     ExternalImageSource::NativeTexture(b) => b,
@@ -549,7 +594,7 @@ impl ExternalImageHandler for WebrenderExternalImageHandlers {
                     source: ExternalImageSource::NativeTexture(texture_id),
                 }
             },
-            WebrenderImageHandlerType::WebGPU => {
+            WebRenderImageHandlerType::WebGpu => {
                 let (source, size) = self.webgpu_handler.as_mut().unwrap().lock(key.0);
                 ExternalImage {
                     uv: TexelRect::new(0.0, size.height as f32, size.width as f32, 0.0),
@@ -567,9 +612,9 @@ impl ExternalImageHandler for WebrenderExternalImageHandlers {
             .get(&key)
             .expect("Tried to get unknown external image");
         match handler_type {
-            WebrenderImageHandlerType::WebGL => self.webgl_handler.as_mut().unwrap().unlock(key.0),
-            WebrenderImageHandlerType::Media => self.media_handler.as_mut().unwrap().unlock(key.0),
-            WebrenderImageHandlerType::WebGPU => {
+            WebRenderImageHandlerType::WebGl => self.webgl_handler.as_mut().unwrap().unlock(key.0),
+            WebRenderImageHandlerType::Media => self.media_handler.as_mut().unwrap().unlock(key.0),
+            WebRenderImageHandlerType::WebGpu => {
                 self.webgpu_handler.as_mut().unwrap().unlock(key.0)
             },
         };
@@ -637,7 +682,6 @@ impl From<SerializableImageData> for ImageData {
 /// layer.
 pub trait WebViewTrait {
     fn id(&self) -> WebViewId;
-    fn rendering_group_id(&self) -> Option<RenderingGroupId>;
     fn screen_geometry(&self) -> Option<ScreenGeometry>;
     fn set_animating(&self, new_value: bool);
 }

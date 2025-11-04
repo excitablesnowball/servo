@@ -6,6 +6,7 @@
 package org.servo.servoview;
 
 import android.app.Activity;
+import android.view.KeyEvent;
 import android.view.Surface;
 
 import org.servo.servoview.JNIServo.ServoCoordinates;
@@ -111,6 +112,14 @@ public class Servo {
         mRunCallback.inGLThread(() -> mJNI.scroll(dx, dy, x, y));
     }
 
+    public void onKeyDown(int keyCode, KeyEvent event) {
+        mRunCallback.inGLThread(() -> mJNI.keydown(keyCode, event.getUnicodeChar()));
+    }
+
+    public void onKeyUp(int keyCode, KeyEvent event) {
+        mRunCallback.inGLThread(() -> mJNI.keyup(keyCode, event.getUnicodeChar()));
+    }
+
     public void touchDown(float x, float y, int pointerId) {
         mRunCallback.inGLThread(() -> mJNI.touchDown(x, y, pointerId));
     }
@@ -127,15 +136,15 @@ public class Servo {
         mRunCallback.inGLThread(() -> mJNI.touchCancel(x, y, pointerId));
     }
 
-    public void pinchZoomStart(float factor, int x, int y) {
+    public void pinchZoomStart(float factor, float x, float y) {
         mRunCallback.inGLThread(() -> mJNI.pinchZoomStart(factor, x, y));
     }
 
-    public void pinchZoom(float factor, int x, int y) {
+    public void pinchZoom(float factor, float x, float y) {
         mRunCallback.inGLThread(() -> mJNI.pinchZoom(factor, x, y));
     }
 
-    public void pinchZoomEnd(float factor, int x, int y) {
+    public void pinchZoomEnd(float factor, float x, float y) {
         mRunCallback.inGLThread(() -> mJNI.pinchZoomEnd(factor, x, y));
     }
 
@@ -158,6 +167,14 @@ public class Servo {
         mRunCallback.inGLThread(() -> mJNI.mediaSessionAction(action));
     }
 
+    public void setExperimentalMode(boolean enable) {
+        mRunCallback.inGLThread(() -> mJNI.setExperimentalMode(enable));
+    }
+
+    public void onDoFrame() {
+        mRunCallback.inGLThread(() -> mJNI.doFrame());
+    }
+
     public interface Client {
         void onAlert(String message);
 
@@ -174,6 +191,9 @@ public class Servo {
         void onHistoryChanged(boolean canGoBack, boolean canGoForward);
 
         void onRedrawing(boolean redrawing);
+
+        void onImeShow();
+        void onImeHide();
 
         void onMediaSessionMetadata(String title, String artist, String album);
 
@@ -232,6 +252,14 @@ public class Servo {
 
         public void onShutdownComplete() {
             mShutdownComplete = true;
+        }
+
+        public void onImeShow() {
+            mRunCallback.inUIThread(() -> mClient.onImeShow());
+        }
+
+        public void onImeHide() {
+            mRunCallback.inUIThread(() -> mClient.onImeHide());
         }
 
         public void onAnimatingChanged(boolean animating) {

@@ -7,30 +7,31 @@ use std::rc::Rc;
 
 use crossbeam_channel::Receiver;
 use dpi::PhysicalSize;
-use euclid::{Point2D, Rect, Scale, Size2D, Vector2D};
+use euclid::{Point2D, Rect, Scale, Size2D};
 use image::{DynamicImage, ImageFormat};
 use keyboard_types::{CompositionEvent, CompositionState, Key, KeyState, NamedKey};
 use log::{debug, error, info, warn};
 use raw_window_handle::{RawWindowHandle, WindowHandle};
 use servo::base::generic_channel::GenericSender;
 use servo::base::id::WebViewId;
-use servo::ipc_channel::ipc::IpcSender;
 use servo::servo_geometry::DeviceIndependentPixel;
-use servo::webrender_api::ScrollLocation;
-use servo::webrender_api::units::{DeviceIntRect, DeviceIntSize, DevicePixel};
+use servo::webrender_api::units::{
+    DeviceIntRect, DeviceIntSize, DevicePixel, DevicePoint, DeviceVector2D,
+};
 use servo::{
-    AllowOrDenyRequest, ContextMenuResult, ImeEvent, InputEvent, InputMethodType, KeyboardEvent,
-    LoadStatus, MediaSessionActionType, MediaSessionEvent, MouseButton, MouseButtonAction,
-    MouseButtonEvent, MouseMoveEvent, NavigationRequest, PermissionRequest, RefreshDriver,
-    RenderingContext, ScreenGeometry, Servo, ServoDelegate, ServoError, SimpleDialog, TouchEvent,
-    TouchEventType, TouchId, TraversalId, WebDriverCommandMsg, WebDriverJSResult,
-    WebDriverLoadStatus, WebDriverScriptCommand, WebDriverSenders, WebView, WebViewBuilder,
-    WebViewDelegate, WindowRenderingContext,
+    AllowOrDenyRequest, ContextMenuResult, EmbedderControl, EmbedderControlId, ImeEvent,
+    InputEvent, InputEventId, InputEventResult, KeyboardEvent, LoadStatus, MediaSessionActionType,
+    MediaSessionEvent, MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
+    NavigationRequest, PermissionRequest, RefreshDriver, RenderingContext, ScreenGeometry, Scroll,
+    Servo, ServoDelegate, ServoError, TouchEvent, TouchEventType, TouchId, TraversalId,
+    WebDriverCommandMsg, WebDriverLoadStatus, WebView, WebViewBuilder, WebViewDelegate,
+    WindowRenderingContext,
 };
 use url::Url;
 
 use crate::egl::host_trait::HostTrait;
 use crate::prefs::ServoShellPreferences;
+use crate::running_app_state::{RunningAppStateBase, RunningAppStateTrait};
 
 #[derive(Clone, Debug)]
 pub struct Coordinates {
@@ -71,17 +72,14 @@ impl ServoWindowCallbacks {
 }
 
 pub struct RunningAppState {
-    servo: Servo,
+    base: RunningAppStateBase,
     rendering_context: Rc<WindowRenderingContext>,
     callbacks: Rc<ServoWindowCallbacks>,
     refresh_driver: Option<Rc<VsyncRefreshDriver>>,
     inner: RefCell<RunningAppStateInner>,
-    /// servoshell specific preferences created during startup of the application.
-    servoshell_preferences: ServoShellPreferences,
     /// A [`Receiver`] for receiving commands from a running WebDriver server, if WebDriver
     /// was enabled.
     webdriver_receiver: Option<Receiver<WebDriverCommandMsg>>,
-    webdriver_senders: RefCell<WebDriverSenders>,
 }
 
 struct RunningAppStateInner {
@@ -110,6 +108,9 @@ struct RunningAppStateInner {
     /// Whether or not the application has achieved stable image output. This is used
     /// for the `exit_after_stable_image` option.
     achieved_stable_image: Rc<Cell<bool>>,
+
+    /// A list of showing [`InputMethod`] interfaces.
+    visible_input_methods: Vec<EmbedderControlId>,
 }
 
 struct ServoShellServoDelegate {
@@ -168,6 +169,7 @@ impl WebViewDelegate for RunningAppState {
 
         if load_status == LoadStatus::Complete {
             if let Some(sender) = self
+                .base()
                 .webdriver_senders
                 .borrow_mut()
                 .load_status_senders
@@ -182,7 +184,7 @@ impl WebViewDelegate for RunningAppState {
         if load_status == LoadStatus::Complete {
             #[cfg(feature = "tracing-hitrace")]
             let (snd, recv) = ipc_channel::ipc::channel().expect("Could not create channel");
-            self.servo.create_memory_report(snd);
+            self.servo().create_memory_report(snd);
             std::thread::spawn(move || {
                 let result = recv.recv().expect("Could not get memory report");
                 let reports = result
@@ -208,7 +210,7 @@ impl WebViewDelegate for RunningAppState {
         if let Some(newest_webview) = self.newest_webview() {
             newest_webview.focus();
         } else {
-            self.servo.start_shutting_down();
+            self.servo().start_shutting_down();
         }
     }
 
@@ -222,7 +224,7 @@ impl WebViewDelegate for RunningAppState {
     }
 
     fn notify_traversal_complete(&self, _webview: servo::WebView, traversal_id: TraversalId) {
-        let mut webdriver_state = self.webdriver_senders.borrow_mut();
+        let mut webdriver_state = self.base().webdriver_senders.borrow_mut();
         if let std::collections::hash_map::Entry::Occupied(entry) =
             webdriver_state.pending_traversals.entry(traversal_id)
         {
@@ -260,6 +262,22 @@ impl WebViewDelegate for RunningAppState {
         self.inner_mut().need_present = true;
     }
 
+    fn notify_input_event_handled(
+        &self,
+        _webview: WebView,
+        id: InputEventId,
+        _result: InputEventResult,
+    ) {
+        if let Some(response_sender) = self
+            .base()
+            .pending_webdriver_events
+            .borrow_mut()
+            .remove(&id)
+        {
+            let _ = response_sender.send(());
+        }
+    }
+
     fn request_navigation(&self, _webview: WebView, navigation_request: NavigationRequest) {
         if self
             .callbacks
@@ -273,7 +291,7 @@ impl WebViewDelegate for RunningAppState {
     }
 
     fn request_open_auxiliary_webview(&self, parent_webview: WebView) -> Option<WebView> {
-        let webview = WebViewBuilder::new_auxiliary(&self.servo)
+        let webview = WebViewBuilder::new_auxiliary(self.servo())
             .delegate(parent_webview.delegate())
             .hidpi_scale_factor(self.inner().hidpi_scale_factor)
             .build();
@@ -309,27 +327,33 @@ impl WebViewDelegate for RunningAppState {
         }
     }
 
-    fn show_simple_dialog(&self, webview: WebView, dialog: SimpleDialog) {
-        self.callbacks
-            .host_callbacks
-            .show_simple_dialog(webview, dialog);
+    fn show_embedder_control(&self, webview: WebView, embedder_control: EmbedderControl) {
+        let control_id = embedder_control.id();
+        match embedder_control {
+            EmbedderControl::InputMethod(input_method_control) => {
+                self.inner_mut().visible_input_methods.push(control_id);
+                self.callbacks
+                    .host_callbacks
+                    .on_ime_show(input_method_control);
+            },
+            EmbedderControl::SimpleDialog(simple_dialog) => self
+                .callbacks
+                .host_callbacks
+                .show_simple_dialog(webview, simple_dialog),
+            _ => {},
+        }
     }
 
-    fn show_ime(
-        &self,
-        _webview: WebView,
-        input_method_type: InputMethodType,
-        text: Option<(String, i32)>,
-        multiline: bool,
-        position: DeviceIntRect,
-    ) {
-        self.callbacks
-            .host_callbacks
-            .on_ime_show(input_method_type, text, multiline, position);
-    }
-
-    fn hide_ime(&self, _webview: WebView) {
-        self.callbacks.host_callbacks.on_ime_hide();
+    fn hide_embedder_control(&self, _webview: WebView, control_id: servo::EmbedderControlId) {
+        let mut inner_mut = self.inner_mut();
+        if let Some(index) = inner_mut
+            .visible_input_methods
+            .iter()
+            .position(|visible_id| *visible_id == control_id)
+        {
+            inner_mut.visible_input_methods.remove(index);
+            self.callbacks.host_callbacks.on_ime_hide();
+        }
     }
 }
 
@@ -357,6 +381,20 @@ impl RefreshDriver for VsyncRefreshDriver {
     }
 }
 
+impl RunningAppStateTrait for RunningAppState {
+    fn base(&self) -> &RunningAppStateBase {
+        &self.base
+    }
+
+    fn base_mut(&mut self) -> &mut RunningAppStateBase {
+        &mut self.base
+    }
+
+    fn webview_by_id(&self, id: WebViewId) -> Option<WebView> {
+        self.inner().webviews.get(&id).cloned()
+    }
+}
+
 #[allow(unused)]
 impl RunningAppState {
     pub(super) fn new(
@@ -381,13 +419,11 @@ impl RunningAppState {
         }));
 
         let app_state = Rc::new(Self {
+            base: RunningAppStateBase::new(servoshell_preferences, servo),
             rendering_context,
-            servo,
             callbacks,
             refresh_driver,
-            servoshell_preferences,
             webdriver_receiver,
-            webdriver_senders: RefCell::default(),
             inner: RefCell::new(RunningAppStateInner {
                 need_present: false,
                 context_menu_sender: None,
@@ -397,31 +433,12 @@ impl RunningAppState {
                 animating_state_changed,
                 hidpi_scale_factor: Scale::new(hidpi_scale_factor),
                 achieved_stable_image: Default::default(),
+                visible_input_methods: Default::default(),
             }),
         });
 
         app_state.create_and_focus_toplevel_webview(initial_url);
         app_state
-    }
-
-    pub(crate) fn set_script_command_interrupt_sender(
-        &self,
-        sender: Option<IpcSender<WebDriverJSResult>>,
-    ) {
-        self.webdriver_senders
-            .borrow_mut()
-            .script_evaluation_interrupt_sender = sender;
-    }
-
-    pub(crate) fn set_pending_traversal(
-        &self,
-        traversal_id: TraversalId,
-        sender: GenericSender<WebDriverLoadStatus>,
-    ) {
-        self.webdriver_senders
-            .borrow_mut()
-            .pending_traversals
-            .insert(traversal_id, sender);
     }
 
     pub fn webviews(&self) -> Vec<(WebViewId, WebView)> {
@@ -434,7 +451,7 @@ impl RunningAppState {
     }
 
     pub(crate) fn create_and_focus_toplevel_webview(self: &Rc<Self>, url: Url) -> WebView {
-        let webview = WebViewBuilder::new(&self.servo)
+        let webview = WebViewBuilder::new(self.servo())
             .url(url)
             .hidpi_scale_factor(self.inner().hidpi_scale_factor)
             .delegate(self.clone())
@@ -473,10 +490,6 @@ impl RunningAppState {
         self.inner.borrow_mut()
     }
 
-    pub(crate) fn servo(&self) -> &Servo {
-        &self.servo
-    }
-
     pub(crate) fn webdriver_receiver(&self) -> Option<&Receiver<WebDriverCommandMsg>> {
         self.webdriver_receiver.as_ref()
     }
@@ -504,43 +517,22 @@ impl RunningAppState {
             .expect("Should always have an active WebView")
     }
 
-    fn handle_webdriver_script_command(&self, msg: &WebDriverScriptCommand) {
-        match msg {
-            WebDriverScriptCommand::ExecuteScript(_webview_id, response_sender) |
-            WebDriverScriptCommand::ExecuteAsyncScript(_webview_id, response_sender) => {
-                // Give embedder a chance to interrupt the script command.
-                // Webdriver only handles 1 script command at a time, so we can
-                // safely set a new interrupt sender and remove the previous one here.
-                self.set_script_command_interrupt_sender(Some(response_sender.clone()));
-            },
-            WebDriverScriptCommand::AddLoadStatusSender(webview_id, load_status_sender) => {
-                self.set_load_status_sender(*webview_id, load_status_sender.clone());
-            },
-            WebDriverScriptCommand::RemoveLoadStatusSender(webview_id) => {
-                self.remove_load_status_sender(*webview_id);
-            },
-            _ => {
-                self.set_script_command_interrupt_sender(None);
-            },
-        }
-    }
-
     /// Request shutdown. Will call on_shutdown_complete.
     pub fn request_shutdown(&self) {
-        self.servo.start_shutting_down();
+        self.servo().start_shutting_down();
         self.perform_updates();
     }
 
     /// Call after on_shutdown_complete
     pub fn deinit(self) {
-        self.servo.deinit();
+        self.servo().deinit();
     }
 
     /// This is the Servo heartbeat. This needs to be called
     /// everytime wakeup is called or when embedder wants Servo
     /// to act on its pending events.
     pub fn perform_updates(&self) {
-        let should_continue = self.servo.spin_event_loop();
+        let should_continue = self.servo().spin_event_loop();
         if !should_continue {
             self.callbacks.host_callbacks.on_shutdown_complete();
         }
@@ -548,7 +540,7 @@ impl RunningAppState {
             self.inner().animating_state_changed.set(false);
             self.callbacks
                 .host_callbacks
-                .on_animating_changed(self.servo.animating());
+                .on_animating_changed(self.servo().animating());
         }
     }
 
@@ -556,9 +548,10 @@ impl RunningAppState {
     pub fn load_uri(&self, url: &str) {
         info!("load_uri: {}", url);
 
-        let Some(url) =
-            crate::parser::location_bar_input_to_url(url, &self.servoshell_preferences.searchpage)
-        else {
+        let Some(url) = crate::parser::location_bar_input_to_url(
+            url,
+            &self.servoshell_preferences().searchpage,
+        ) else {
             warn!("Cannot parse URL");
             return;
         };
@@ -606,20 +599,15 @@ impl RunningAppState {
     /// Scroll.
     /// x/y are scroll coordinates.
     /// dx/dy are scroll deltas.
-    pub fn scroll(&self, dx: f32, dy: f32, x: i32, y: i32) {
-        let delta = Vector2D::new(dx, dy);
-        let scroll_location = ScrollLocation::Delta(delta);
-        self.active_webview()
-            .notify_scroll_event(scroll_location, Point2D::new(x, y));
+    pub fn scroll(&self, dx: f32, dy: f32, x: f32, y: f32) {
+        let scroll = Scroll::Delta(DeviceVector2D::new(dx, dy).into());
+        let point = DevicePoint::new(x, y).into();
+        self.active_webview().notify_scroll_event(scroll, point);
         self.perform_updates();
     }
 
     /// WebDriver message handling methods
-    pub fn webview_by_id(&self, id: WebViewId) -> Option<WebView> {
-        self.inner().webviews.get(&id).cloned()
-    }
-
-    pub fn handle_webdriver_messages(self: &Rc<Self>) {
+    pub(crate) fn handle_webdriver_messages(self: &Rc<Self>) {
         if let Some(webdriver_receiver) = &self.webdriver_receiver {
             while let Ok(msg) = webdriver_receiver.try_recv() {
                 match msg {
@@ -720,7 +708,6 @@ impl RunningAppState {
                         }
                     },
                     WebDriverCommandMsg::ScriptCommand(_, ref webdriver_script_command) => {
-                        info!("Handling ScriptCommand: {:?}", webdriver_script_command);
                         self.handle_webdriver_script_command(webdriver_script_command);
                         self.servo().execute_webdriver_command(msg);
                     },
@@ -750,38 +737,31 @@ impl RunningAppState {
                             webview_id, text
                         );
                     },
+                    WebDriverCommandMsg::GetViewportSize(webview_id, response_sender) => {
+                        info!("Handling GetViewportSize for webview {}", webview_id);
+                        let _ = response_sender.send(self.rendering_context.size2d());
+                    },
+                    WebDriverCommandMsg::InputEvent(webview_id, input_event, response_sender) => {
+                        self.handle_webdriver_input_event(webview_id, input_event, response_sender);
+                    },
+                    WebDriverCommandMsg::TakeScreenshot(webview_id, rect, result_sender) => {
+                        self.handle_webdriver_screenshot(webview_id, rect, result_sender);
+                    },
                     _ => {
-                        info!("Received WebDriver command: {:?}", msg);
+                        info!("Received unsupported WebDriver command: {:?}", msg);
                     },
                 }
             }
         }
     }
 
-    pub(crate) fn set_load_status_sender(
-        &self,
-        webview_id: WebViewId,
-        sender: GenericSender<WebDriverLoadStatus>,
-    ) {
-        self.webdriver_senders
-            .borrow_mut()
-            .load_status_senders
-            .insert(webview_id, sender);
-    }
-
-    pub(crate) fn remove_load_status_sender(&self, webview_id: WebViewId) {
-        self.webdriver_senders
-            .borrow_mut()
-            .load_status_senders
-            .remove(&webview_id);
-    }
     /// Touch event: press down
     pub fn touch_down(&self, x: f32, y: f32, pointer_id: i32) {
         self.active_webview()
             .notify_input_event(InputEvent::Touch(TouchEvent::new(
                 TouchEventType::Down,
                 TouchId(pointer_id),
-                Point2D::new(x, y),
+                DevicePoint::new(x, y).into(),
             )));
         self.perform_updates();
     }
@@ -792,7 +772,7 @@ impl RunningAppState {
             .notify_input_event(InputEvent::Touch(TouchEvent::new(
                 TouchEventType::Move,
                 TouchId(pointer_id),
-                Point2D::new(x, y),
+                DevicePoint::new(x, y).into(),
             )));
         self.perform_updates();
     }
@@ -803,7 +783,7 @@ impl RunningAppState {
             .notify_input_event(InputEvent::Touch(TouchEvent::new(
                 TouchEventType::Up,
                 TouchId(pointer_id),
-                Point2D::new(x, y),
+                DevicePoint::new(x, y).into(),
             )));
         self.perform_updates();
     }
@@ -814,7 +794,7 @@ impl RunningAppState {
             .notify_input_event(InputEvent::Touch(TouchEvent::new(
                 TouchEventType::Cancel,
                 TouchId(pointer_id),
-                Point2D::new(x, y),
+                DevicePoint::new(x, y).into(),
             )));
         self.perform_updates();
     }
@@ -822,9 +802,9 @@ impl RunningAppState {
     /// Register a mouse movement.
     pub fn mouse_move(&self, x: f32, y: f32) {
         self.active_webview()
-            .notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(Point2D::new(
-                x, y,
-            ))));
+            .notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(
+                DevicePoint::new(x, y).into(),
+            )));
         self.perform_updates();
     }
 
@@ -834,7 +814,7 @@ impl RunningAppState {
             .notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
                 MouseButtonAction::Down,
                 button,
-                Point2D::new(x, y),
+                DevicePoint::new(x, y).into(),
             )));
         self.perform_updates();
     }
@@ -845,29 +825,32 @@ impl RunningAppState {
             .notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
                 MouseButtonAction::Up,
                 button,
-                Point2D::new(x, y),
+                DevicePoint::new(x, y).into(),
             )));
         self.perform_updates();
     }
 
     /// Start pinchzoom.
     /// x/y are pinch origin coordinates.
-    pub fn pinchzoom_start(&self, factor: f32, _x: u32, _y: u32) {
-        self.active_webview().pinch_zoom(factor);
+    pub fn pinchzoom_start(&self, factor: f32, x: f32, y: f32) {
+        self.active_webview()
+            .pinch_zoom(factor, DevicePoint::new(x, y));
         self.perform_updates();
     }
 
     /// Pinchzoom.
     /// x/y are pinch origin coordinates.
-    pub fn pinchzoom(&self, factor: f32, _x: u32, _y: u32) {
-        self.active_webview().pinch_zoom(factor);
+    pub fn pinchzoom(&self, factor: f32, x: f32, y: f32) {
+        self.active_webview()
+            .pinch_zoom(factor, DevicePoint::new(x, y));
         self.perform_updates();
     }
 
     /// End pinchzoom.
     /// x/y are pinch origin coordinates.
-    pub fn pinchzoom_end(&self, factor: f32, _x: u32, _y: u32) {
-        self.active_webview().pinch_zoom(factor);
+    pub fn pinchzoom_end(&self, factor: f32, x: f32, y: f32) {
+        self.active_webview()
+            .pinch_zoom(factor, DevicePoint::new(x, y));
         self.perform_updates();
     }
 
@@ -972,7 +955,7 @@ impl RunningAppState {
         self.active_webview().paint();
         self.rendering_context.present();
 
-        if self.servoshell_preferences.exit_after_stable_image &&
+        if self.servoshell_preferences().exit_after_stable_image &&
             self.inner().achieved_stable_image.get()
         {
             self.request_shutdown();
@@ -982,8 +965,8 @@ impl RunningAppState {
     /// If we are exiting after achieving a stable image or we want to save the display of the
     /// [`WebView`] to an image file, request a screenshot of the [`WebView`].
     fn maybe_request_screenshot(&self, webview: WebView) {
-        let output_path = self.servoshell_preferences.output_image_path.clone();
-        if !self.servoshell_preferences.exit_after_stable_image && output_path.is_none() {
+        let output_path = self.servoshell_preferences().output_image_path.clone();
+        if !self.servoshell_preferences().exit_after_stable_image && output_path.is_none() {
             return;
         }
 

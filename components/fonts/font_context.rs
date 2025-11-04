@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use app_units::Au;
-use base::id::{RenderingGroupId, WebViewId};
+use base::id::{PainterId, WebViewId};
 use compositing_traits::CrossProcessCompositorApi;
 use fonts_traits::{
     CSSFontFaceDescriptors, FontDescriptor, FontIdentifier, FontTemplate, FontTemplateRef,
@@ -24,7 +24,7 @@ use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashSet;
 use servo_arc::Arc as ServoArc;
 use servo_config::pref;
-use servo_url::ServoUrl;
+use servo_url::{ImmutableOrigin, ServoUrl};
 use style::Atom;
 use style::computed_values::font_variant_caps::T as FontVariantCaps;
 use style::font_face::{
@@ -286,7 +286,7 @@ impl FontContext {
     pub(crate) fn create_font_instance_key(
         &self,
         font: &Font,
-        rendering_group_id: RenderingGroupId,
+        painter_id: PainterId,
     ) -> FontInstanceKey {
         match font.template.identifier() {
             FontIdentifier::Local(_) => self.system_font_service_proxy.get_system_font_instance(
@@ -294,14 +294,14 @@ impl FontContext {
                 font.descriptor.pt_size,
                 font.webrender_font_instance_flags(),
                 font.variations().to_owned(),
-                rendering_group_id,
+                painter_id,
             ),
             FontIdentifier::Web(_) => self.create_web_font_instance(
                 font.template.clone(),
                 font.descriptor.pt_size,
                 font.webrender_font_instance_flags(),
                 font.variations().to_owned(),
-                rendering_group_id,
+                painter_id,
             ),
         }
     }
@@ -312,7 +312,7 @@ impl FontContext {
         pt_size: Au,
         flags: FontInstanceFlags,
         variations: Vec<FontVariation>,
-        rendering_group_id: RenderingGroupId,
+        painter_id: PainterId,
     ) -> FontInstanceKey {
         let identifier = font_template.identifier().clone();
         let font_data = self
@@ -323,9 +323,7 @@ impl FontContext {
             .write()
             .entry(identifier.clone())
             .or_insert_with(|| {
-                let font_key = self
-                    .system_font_service_proxy
-                    .generate_font_key(rendering_group_id);
+                let font_key = self.system_font_service_proxy.generate_font_key(painter_id);
                 self.compositor_api.lock().add_font(
                     font_key,
                     font_data.as_ipc_shared_memory(),
@@ -347,7 +345,7 @@ impl FontContext {
             .or_insert_with(|| {
                 let font_instance_key = self
                     .system_font_service_proxy
-                    .generate_font_instance_key(rendering_group_id);
+                    .generate_font_instance_key(painter_id);
                 self.compositor_api.lock().add_font_instance(
                     font_instance_key,
                     font_key,
@@ -538,7 +536,7 @@ impl FontContextWebFontMethods for Arc<FontContext> {
         finished_callback: StylesheetWebFontLoadFinishedCallback,
     ) -> usize {
         let mut number_loading = 0;
-        for rule in stylesheet.effective_rules(device, guard) {
+        for rule in stylesheet.contents(guard).effective_rules(device, guard) {
             let CssRule::FontFace(ref lock) = *rule else {
                 continue;
             };
@@ -820,6 +818,8 @@ impl RemoteWebFontDownloader {
             RequestBuilder::new(state.webview_id, url.clone().into(), Referrer::NoReferrer)
                 // TODO: Set policy_container from globalscope that contains the fontcontext
                 .policy_container(Default::default())
+                // TODO: Set origin from document that contains the fontcontext
+                .origin(ImmutableOrigin::new(url.origin()))
                 .destination(Destination::Font);
 
         let core_resource_thread_clone = state.core_resource_thread.clone();

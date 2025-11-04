@@ -60,9 +60,9 @@ use crate::dom::html::htmltitleelement::HTMLTitleElement;
 use crate::dom::html::htmlvideoelement::HTMLVideoElement;
 use crate::dom::node::{BindContext, ChildrenMutation, CloneChildrenFlag, Node, UnbindContext};
 use crate::dom::shadowroot::ShadowRoot;
-use crate::dom::svgelement::SVGElement;
-use crate::dom::svgimageelement::SVGImageElement;
-use crate::dom::svgsvgelement::SVGSVGElement;
+use crate::dom::svg::svgelement::SVGElement;
+use crate::dom::svg::svgimageelement::SVGImageElement;
+use crate::dom::svg::svgsvgelement::SVGSVGElement;
 
 /// Trait to allow DOM nodes to opt-in to overriding (or adding to) common
 /// behaviours. Replicates the effect of C++ virtual methods.
@@ -101,22 +101,20 @@ pub(crate) trait VirtualMethods {
     /// Invoked during a DOM tree mutation after a node becomes connected, once all
     /// related DOM tree mutations have been applied.
     /// <https://dom.spec.whatwg.org/#concept-node-post-connection-ext>
-    fn post_connection_steps(&self) {
+    fn post_connection_steps(&self, can_gc: CanGc) {
         if let Some(s) = self.super_type() {
-            s.post_connection_steps();
+            s.post_connection_steps(can_gc);
         }
     }
 
-    /// Called when a Node is appended to a tree, where 'tree_connected' indicates
-    /// whether the tree is part of a Document.
+    /// Called when a Node is appended to a tree.
     fn bind_to_tree(&self, context: &BindContext, can_gc: CanGc) {
         if let Some(s) = self.super_type() {
             s.bind_to_tree(context, can_gc);
         }
     }
 
-    /// Called when a Node is removed from a tree, where 'tree_connected'
-    /// indicates whether the tree is part of a Document.
+    /// Called when a Node is removed from a tree.
     /// Implements removing steps:
     /// <https://dom.spec.whatwg.org/#concept-node-remove-ext>
     fn unbind_from_tree(&self, context: &UnbindContext, can_gc: CanGc) {
@@ -126,9 +124,9 @@ pub(crate) trait VirtualMethods {
     }
 
     /// Called on the parent when its children are changed.
-    fn children_changed(&self, mutation: &ChildrenMutation) {
+    fn children_changed(&self, mutation: &ChildrenMutation, can_gc: CanGc) {
         if let Some(s) = self.super_type() {
-            s.children_changed(mutation);
+            s.children_changed(mutation, can_gc);
         }
     }
 

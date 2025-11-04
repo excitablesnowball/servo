@@ -14,6 +14,16 @@ feature-depth = 1
 ignore = [
     # The crate `paste` is no longer maintained.
     "RUSTSEC-2024-0436",
+    # The crate `unic-char-range` is unmaintained.
+    "RUSTSEC-2025-0075",
+    # The crate `unic-common` is unmaintained.
+    "RUSTSEC-2025-0080",
+    # The crate `unic-char-property` is unmaintained.
+    "RUSTSEC-2025-0081",
+    # The crate `unic-ucd-version` is unmaintained.
+    "RUSTSEC-2025-0098",
+    # The crate `unic-ucd-ident` is unmaintained.
+    "RUSTSEC-2025-0100",
 ]
 
 # This section is considered when running `cargo deny check licenses`
@@ -165,11 +175,6 @@ skip = [
     # and bindgen updates the cexpr version
     "nom",
 
-    # duplicated by `cargo metadata` as a build-dependency of mozjs-sys.
-    # Can be removed if `icu_capi` exposes the C include dir via the `DEP_`
-    # variable in the future.
-    "ordered-float",
-
     # duplicated by image 0.25
     "cfg-expr",
     "system-deps",
@@ -183,8 +188,11 @@ skip = [
     # really just a build dep, so not a large problem.
     "toml_datetime",
     "toml_edit",
+
+    # usvg depends on svgtypes, which depends on old version of kurbo
+    "kurbo",
 ]
 
 # github.com organizations to allow git sources for
 [sources.allow-org]
-github = ["servo", "linebender"]
+github = ["servo"]

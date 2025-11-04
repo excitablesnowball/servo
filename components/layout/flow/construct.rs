@@ -230,7 +230,6 @@ impl<'dom, 'style> BlockContainerBuilder<'dom, 'style> {
             !self.have_already_seen_first_line_for_text_indent,
             self.info.node.is_single_line_text_input(),
             self.info.style.to_bidi_level(),
-            self.context.rendering_group_id,
         )
     }
 
@@ -477,11 +476,7 @@ impl<'dom> BlockContainerBuilder<'dom, '_> {
         // Otherwise, this is just a normal inline box. Whatever happened before, all we need to do
         // before recurring is to remember this ongoing inline level box.
         self.ensure_inline_formatting_context_builder()
-            .start_inline_box(
-                || ArcRefCell::new(InlineBox::new(info)),
-                None,
-                old_layout_box,
-            );
+            .start_inline_box(|| ArcRefCell::new(InlineBox::new(info)), old_layout_box);
 
         if is_list_item {
             if let Some((marker_info, marker_contents)) =

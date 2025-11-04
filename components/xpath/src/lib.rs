@@ -7,27 +7,26 @@ mod context;
 mod eval;
 mod eval_function;
 mod parser;
+mod tokenizer;
 mod value;
 
-use std::fmt::Debug;
+use std::fmt;
 use std::hash::Hash;
 
 pub use ast::Expression;
 use ast::QName;
 use context::EvaluationCtx;
 use markup5ever::{LocalName, Namespace, Prefix};
-use parser::{OwnedParserError, parse as parse_impl};
+pub use parser::{Error as ParserError, parse};
 pub use value::{NodesetHelpers, Value};
 
 pub trait Dom {
     type Node: Node;
-    /// An exception that can occur during JS evaluation.
-    type JsError: Debug;
-    type NamespaceResolver: NamespaceResolver<Self::JsError>;
+    type NamespaceResolver: NamespaceResolver;
 }
 
 /// A handle to a DOM node exposing all functionality needed by xpath.
-pub trait Node: Eq + Clone + Debug {
+pub trait Node: Eq + Clone + fmt::Debug {
     type ProcessingInstruction: ProcessingInstruction;
     type Document: Document<Node = Self>;
     type Attribute: Attribute<Node = Self>;
@@ -58,8 +57,8 @@ pub trait Node: Eq + Clone + Debug {
     fn get_root_node(&self) -> Self;
 }
 
-pub trait NamespaceResolver<E>: Clone {
-    fn resolve_namespace_prefix(&self, prefix: Option<&str>) -> Result<Option<String>, E>;
+pub trait NamespaceResolver: Clone {
+    fn resolve_namespace_prefix(&self, prefix: &str) -> Option<String>;
 }
 
 pub trait ProcessingInstruction {
@@ -94,27 +93,12 @@ pub trait Attribute {
     fn local_name(&self) -> LocalName;
 }
 
-/// Parse an XPath expression from a string
-pub fn parse<E>(xpath: &str) -> Result<Expression, Error<E>> {
-    match parse_impl(xpath) {
-        Ok(expression) => {
-            log::debug!("Parsed XPath: {expression:?}");
-            Ok(expression)
-        },
-        Err(error) => {
-            log::debug!("Unable to parse XPath: {error}");
-            Err(Error::Parsing(error))
-        },
-    }
-}
-
 /// Evaluate an already-parsed XPath expression
 pub fn evaluate_parsed_xpath<D: Dom>(
     expr: &Expression,
     context_node: D::Node,
-    resolver: Option<D::NamespaceResolver>,
-) -> Result<Value<D::Node>, Error<D::JsError>> {
-    let context = EvaluationCtx::<D>::new(context_node, resolver);
+) -> Result<Value<D::Node>, Error> {
+    let context = EvaluationCtx::<D>::new(context_node);
     match expr.evaluate(&context) {
         Ok(value) => {
             log::debug!("Evaluated XPath: {value:?}");
@@ -128,7 +112,7 @@ pub fn evaluate_parsed_xpath<D: Dom>(
 }
 
 #[derive(Clone, Debug)]
-pub enum Error<JsError> {
+pub enum Error {
     NotANodeset,
     /// It is not clear where variables used in XPath expression should come from.
     /// Firefox throws "NS_ERROR_ILLEGAL_VALUE" when using them, chrome seems to return
@@ -142,9 +126,6 @@ pub enum Error<JsError> {
     Internal {
         msg: String,
     },
-    /// A JS exception that needs to be propagated to the caller.
-    JsException(JsError),
-    Parsing(OwnedParserError),
 }
 
 /// <https://www.w3.org/TR/xml/#NT-NameStartChar>

@@ -58,7 +58,7 @@ use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::node::{ChildrenMutation, CloneChildrenFlag, Node, NodeTraits};
-use crate::dom::performanceresourcetiming::InitiatorType;
+use crate::dom::performance::performanceresourcetiming::InitiatorType;
 use crate::dom::trustedscript::TrustedScript;
 use crate::dom::trustedscripturl::TrustedScriptURL;
 use crate::dom::virtualmethods::VirtualMethods;
@@ -232,11 +232,11 @@ pub(crate) enum SourceCode {
 
 #[derive(JSTraceable, MallocSizeOf)]
 pub(crate) struct ScriptOrigin {
-    code: SourceCode,
+    pub code: SourceCode,
     #[no_trace]
-    url: ServoUrl,
+    pub url: ServoUrl,
     external: bool,
-    fetch_options: ScriptFetchOptions,
+    pub fetch_options: ScriptFetchOptions,
     type_: ScriptType,
     unminified_dir: Option<String>,
     import_map: Fallible<ImportMap>,
@@ -1060,7 +1060,17 @@ impl HTMLScriptElement {
                 } else {
                     document.set_current_script(Some(self))
                 }
-                self.run_a_classic_script(&script, can_gc, Some(introduction_type));
+                let line_number = if script.external {
+                    1
+                } else {
+                    self.line_number as u32
+                };
+                self.owner_window().as_global_scope().run_a_classic_script(
+                    &script,
+                    line_number,
+                    Some(introduction_type),
+                    can_gc,
+                );
                 document.set_current_script(old_script.as_deref());
             },
             ScriptType::Module => {
@@ -1083,42 +1093,6 @@ impl HTMLScriptElement {
         if script.external {
             self.dispatch_load_event(can_gc);
         }
-    }
-
-    // https://html.spec.whatwg.org/multipage/#run-a-classic-script
-    pub(crate) fn run_a_classic_script(
-        &self,
-        script: &ScriptOrigin,
-        can_gc: CanGc,
-        introduction_type: Option<&'static CStr>,
-    ) {
-        // TODO use a settings object rather than this element's document/window
-        // Step 2
-        let document = self.owner_document();
-        if !document.is_fully_active() || !document.scripting_enabled() {
-            return;
-        }
-
-        // Steps 4-10
-        let window = self.owner_window();
-        let line_number = if script.external {
-            1
-        } else {
-            self.line_number as u32
-        };
-        rooted!(in(*GlobalScope::get_cx()) let mut rval = UndefinedValue());
-        _ = window
-            .as_global_scope()
-            .evaluate_script_on_global_with_result(
-                &script.code,
-                script.url.as_str(),
-                rval.handle_mut(),
-                line_number,
-                script.fetch_options.clone(),
-                script.url.clone(),
-                can_gc,
-                introduction_type,
-            );
     }
 
     #[allow(unsafe_code)]
@@ -1318,9 +1292,9 @@ impl VirtualMethods for HTMLScriptElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#script-processing-model:the-script-element-26>
-    fn children_changed(&self, mutation: &ChildrenMutation) {
+    fn children_changed(&self, mutation: &ChildrenMutation, can_gc: CanGc) {
         if let Some(s) = self.super_type() {
-            s.children_changed(mutation);
+            s.children_changed(mutation, can_gc);
         }
 
         if self.upcast::<Node>().is_connected() && !self.parser_inserted.get() {
@@ -1337,13 +1311,13 @@ impl VirtualMethods for HTMLScriptElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#script-processing-model:the-script-element-20>
-    fn post_connection_steps(&self) {
+    fn post_connection_steps(&self, can_gc: CanGc) {
         if let Some(s) = self.super_type() {
-            s.post_connection_steps();
+            s.post_connection_steps(can_gc);
         }
 
         if self.upcast::<Node>().is_connected() && !self.parser_inserted.get() {
-            self.prepare(Some(IntroductionType::INJECTED_SCRIPT), CanGc::note());
+            self.prepare(Some(IntroductionType::INJECTED_SCRIPT), can_gc);
         }
     }
 
@@ -1368,7 +1342,7 @@ impl VirtualMethods for HTMLScriptElement {
 }
 
 impl HTMLScriptElementMethods<crate::DomTypeHolder> for HTMLScriptElement {
-    // https://html.spec.whatwg.org/multipage/#dom-script-src
+    /// <https://html.spec.whatwg.org/multipage/#dom-script-src>
     fn Src(&self) -> TrustedScriptURLOrUSVString {
         let element = self.upcast::<Element>();
         element.get_trusted_type_url_attribute(&local_name!("src"))
@@ -1403,14 +1377,14 @@ impl HTMLScriptElementMethods<crate::DomTypeHolder> for HTMLScriptElement {
     // https://html.spec.whatwg.org/multipage/#dom-script-charset
     make_setter!(SetCharset, "charset");
 
-    // https://html.spec.whatwg.org/multipage/#dom-script-async
+    /// <https://html.spec.whatwg.org/multipage/#dom-script-async>
     fn Async(&self) -> bool {
         self.non_blocking.get() ||
             self.upcast::<Element>()
                 .has_attribute(&local_name!("async"))
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-script-async
+    /// <https://html.spec.whatwg.org/multipage/#dom-script-async>
     fn SetAsync(&self, value: bool, can_gc: CanGc) {
         self.non_blocking.set(false);
         self.upcast::<Element>()
@@ -1442,17 +1416,17 @@ impl HTMLScriptElementMethods<crate::DomTypeHolder> for HTMLScriptElement {
     // https://html.spec.whatwg.org/multipage/#dom-script-htmlfor
     make_setter!(SetHtmlFor, "for");
 
-    // https://html.spec.whatwg.org/multipage/#dom-script-crossorigin
+    /// <https://html.spec.whatwg.org/multipage/#dom-script-crossorigin>
     fn GetCrossOrigin(&self) -> Option<DOMString> {
         reflect_cross_origin_attribute(self.upcast::<Element>())
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-script-crossorigin
+    /// <https://html.spec.whatwg.org/multipage/#dom-script-crossorigin>
     fn SetCrossOrigin(&self, value: Option<DOMString>, can_gc: CanGc) {
         set_cross_origin_attribute(self.upcast::<Element>(), value, can_gc);
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-script-referrerpolicy
+    /// <https://html.spec.whatwg.org/multipage/#dom-script-referrerpolicy>
     fn ReferrerPolicy(&self) -> DOMString {
         reflect_referrer_policy_attribute(self.upcast::<Element>())
     }

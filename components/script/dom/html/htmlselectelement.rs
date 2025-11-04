@@ -164,7 +164,7 @@ impl HTMLSelectElement {
         })
     }
 
-    // https://html.spec.whatwg.org/multipage/#placeholder-label-option
+    /// <https://html.spec.whatwg.org/multipage/#placeholder-label-option>
     fn get_placeholder_label_option(&self) -> Option<DomRoot<HTMLOptionElement>> {
         if self.Required() && !self.Multiple() && self.display_size() == 1 {
             self.list_of_options().next().filter(|node| {
@@ -242,7 +242,7 @@ impl HTMLSelectElement {
         }
     }
 
-    // https://html.spec.whatwg.org/multipage/#concept-select-size
+    /// <https://html.spec.whatwg.org/multipage/#concept-select-size>
     fn display_size(&self) -> u32 {
         if self.Size() == 0 {
             if self.Multiple() { 4 } else { 1 }
@@ -568,7 +568,7 @@ impl HTMLSelectElementMethods<crate::DomTypeHolder> for HTMLSelectElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-select-value>
-    fn SetValue(&self, value: DOMString) {
+    fn SetValue(&self, value: DOMString, can_gc: CanGc) {
         let mut opt_iter = self.list_of_options();
         // Reset until we find an <option> with a matching value
         for opt in opt_iter.by_ref() {
@@ -584,8 +584,8 @@ impl HTMLSelectElementMethods<crate::DomTypeHolder> for HTMLSelectElement {
             opt.set_selectedness(false);
         }
 
-        self.validity_state()
-            .perform_validation_and_update(ValidationFlags::VALUE_MISSING, CanGc::note());
+        self.validity_state(can_gc)
+            .perform_validation_and_update(ValidationFlags::VALUE_MISSING, can_gc);
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-select-selectedindex>
@@ -630,8 +630,8 @@ impl HTMLSelectElementMethods<crate::DomTypeHolder> for HTMLSelectElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-cva-validity>
-    fn Validity(&self) -> DomRoot<ValidityState> {
-        self.validity_state()
+    fn Validity(&self, can_gc: CanGc) -> DomRoot<ValidityState> {
+        self.validity_state(can_gc)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-cva-checkvalidity>
@@ -650,8 +650,8 @@ impl HTMLSelectElementMethods<crate::DomTypeHolder> for HTMLSelectElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-cva-setcustomvalidity>
-    fn SetCustomValidity(&self, error: DOMString) {
-        self.validity_state().set_custom_error_message(error);
+    fn SetCustomValidity(&self, error: DOMString, can_gc: CanGc) {
+        self.validity_state(can_gc).set_custom_error_message(error);
     }
 }
 
@@ -667,7 +667,7 @@ impl VirtualMethods for HTMLSelectElement {
             .attribute_mutated(attr, mutation, can_gc);
         match *attr.local_name() {
             local_name!("required") => {
-                self.validity_state()
+                self.validity_state(can_gc)
                     .perform_validation_and_update(ValidationFlags::VALUE_MISSING, can_gc);
             },
             local_name!("disabled") => {
@@ -684,7 +684,7 @@ impl VirtualMethods for HTMLSelectElement {
                     },
                 }
 
-                self.validity_state()
+                self.validity_state(can_gc)
                     .perform_validation_and_update(ValidationFlags::VALUE_MISSING, can_gc);
             },
             local_name!("form") => {
@@ -727,12 +727,12 @@ impl VirtualMethods for HTMLSelectElement {
             .hide_embedder_control(self.upcast());
     }
 
-    fn children_changed(&self, mutation: &ChildrenMutation) {
+    fn children_changed(&self, mutation: &ChildrenMutation, can_gc: CanGc) {
         if let Some(s) = self.super_type() {
-            s.children_changed(mutation);
+            s.children_changed(mutation, can_gc);
         }
 
-        self.update_shadow_tree(CanGc::note());
+        self.update_shadow_tree(can_gc);
     }
 
     fn parse_plain_attribute(&self, local_name: &LocalName, value: DOMString) -> AttrValue {
@@ -776,9 +776,9 @@ impl Validatable for HTMLSelectElement {
         self.upcast()
     }
 
-    fn validity_state(&self) -> DomRoot<ValidityState> {
+    fn validity_state(&self, can_gc: CanGc) -> DomRoot<ValidityState> {
         self.validity_state
-            .or_init(|| ValidityState::new(&self.owner_window(), self.upcast(), CanGc::note()))
+            .or_init(|| ValidityState::new(&self.owner_window(), self.upcast(), can_gc))
     }
 
     fn is_instance_validatable(&self) -> bool {

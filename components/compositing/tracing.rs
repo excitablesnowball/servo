@@ -37,7 +37,8 @@ mod from_constellation {
                 Self::NewWebRenderFrameReady(..) => target!("NewWebRenderFrameReady"),
                 Self::PipelineExited(..) => target!("PipelineExited"),
                 Self::SendInitialTransaction(..) => target!("SendInitialTransaction"),
-                Self::SendScrollNode(..) => target!("SendScrollNode"),
+                Self::ScrollNodeByDelta(..) => target!("ScrollNodeByDelta"),
+                Self::ScrollViewportByDelta(..) => target!("ScrollViewportByDelta"),
                 Self::UpdateEpoch { .. } => target!("UpdateEpoch"),
                 Self::SendDisplayList { .. } => target!("SendDisplayList"),
                 Self::GenerateFrame { .. } => target!("GenerateFrame"),
@@ -53,6 +54,7 @@ mod from_constellation {
                 Self::GenerateImageKeysForPipeline(..) => target!("GenerateImageKeysForPipeline"),
                 Self::DelayNewFrameForCanvas(..) => target!("DelayFramesForCanvas"),
                 Self::ScreenshotReadinessReponse(..) => target!("ScreenshotReadinessResponse"),
+                Self::SendLCPCandidate(..) => target!("SendLCPCandidate"),
             }
         }
     }

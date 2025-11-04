@@ -5,7 +5,6 @@
 use std::borrow::Cow;
 use std::char::{ToLowercase, ToUppercase};
 
-use base::id::RenderingGroupId;
 use icu_segmenter::WordSegmenter;
 use itertools::izip;
 use style::computed_values::white_space_collapse::T as WhiteSpaceCollapse;
@@ -219,7 +218,6 @@ impl InlineFormattingContextBuilder {
     pub(crate) fn start_inline_box(
         &mut self,
         inline_box_creator: impl FnOnce() -> ArcRefCell<InlineBox>,
-        block_in_inline_splits: Option<Vec<ArcRefCell<InlineItem>>>,
         old_layout_box: Option<LayoutBox>,
     ) {
         // If there is an existing undamaged layout box that's compatible, use the `InlineBox` within it.
@@ -239,17 +237,13 @@ impl InlineFormattingContextBuilder {
                 "Create inline box with incompatible `old_layout_box`"
             );
 
-            self.start_inline_box_internal(
-                inline_box_creator,
-                block_in_inline_splits,
-                old_block_in_inline_splits,
-            );
+            self.start_inline_box_internal(inline_box_creator, None, old_block_in_inline_splits);
         } else {
-            self.start_inline_box_internal(inline_box_creator, block_in_inline_splits, vec![]);
+            self.start_inline_box_internal(inline_box_creator, None, vec![]);
         }
     }
 
-    pub fn start_inline_box_internal(
+    fn start_inline_box_internal(
         &mut self,
         inline_box_creator: impl FnOnce() -> ArcRefCell<InlineBox>,
         block_in_inline_splits: Option<Vec<ArcRefCell<InlineItem>>>,
@@ -476,7 +470,6 @@ impl InlineFormattingContextBuilder {
             has_first_formatted_line,
             /* is_single_line_text_input = */ false,
             default_bidi_level,
-            layout_context.rendering_group_id,
         )
     }
 
@@ -487,7 +480,6 @@ impl InlineFormattingContextBuilder {
         has_first_formatted_line: bool,
         is_single_line_text_input: bool,
         default_bidi_level: Level,
-        rendering_group_id: RenderingGroupId,
     ) -> Option<InlineFormattingContext> {
         if self.is_empty {
             return None;
@@ -501,7 +493,6 @@ impl InlineFormattingContextBuilder {
             has_first_formatted_line,
             is_single_line_text_input,
             default_bidi_level,
-            rendering_group_id,
         ))
     }
 }

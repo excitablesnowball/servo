@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::env::consts::ARCH;
 use std::sync::{RwLock, RwLockReadGuard};
 
 use serde::{Deserialize, Serialize};
@@ -11,11 +12,11 @@ pub use crate::pref_util::PrefValue;
 
 static PREFERENCES: RwLock<Preferences> = RwLock::new(Preferences::const_default());
 
-pub trait Observer: Send + Sync {
+pub trait PreferencesObserver: Send + Sync {
     fn prefs_changed(&self, _changes: &[(&'static str, PrefValue)]) {}
 }
 
-static OBSERVERS: RwLock<Vec<Box<dyn Observer>>> = RwLock::new(Vec::new());
+static OBSERVERS: RwLock<Vec<Box<dyn PreferencesObserver>>> = RwLock::new(Vec::new());
 
 #[inline]
 /// Get the current set of global preferences for Servo.
@@ -23,7 +24,7 @@ pub fn get() -> RwLockReadGuard<'static, Preferences> {
     PREFERENCES.read().unwrap()
 }
 
-pub fn add_observer(observer: Box<dyn Observer>) {
+pub fn add_observer(observer: Box<dyn PreferencesObserver>) {
     OBSERVERS.write().unwrap().push(observer);
 }
 
@@ -118,7 +119,7 @@ pub struct Preferences {
     pub dom_indexeddb_enabled: bool,
     pub dom_intersection_observer_enabled: bool,
     pub dom_microdata_testing_enabled: bool,
-    pub dom_mouse_event_which_enabled: bool,
+    pub dom_uievent_which_enabled: bool,
     pub dom_mutation_observer_enabled: bool,
     pub dom_navigator_sendbeacon_enabled: bool,
     pub dom_notification_enabled: bool,
@@ -146,7 +147,6 @@ pub struct Preferences {
     pub dom_testperf_enabled: bool,
     // https://testutils.spec.whatwg.org#availability
     pub dom_testutils_enabled: bool,
-    pub dom_xpath_enabled: bool,
     /// Enable WebGL2 APIs.
     pub dom_webgl2_enabled: bool,
     pub dom_webrtc_enabled: bool,
@@ -224,6 +224,7 @@ pub struct Preferences {
     pub js_wasm_enabled: bool,
     pub js_wasm_ion_enabled: bool,
     pub js_werror_enabled: bool,
+    pub largest_contentful_paint_enabled: bool,
     pub layout_animations_test_enabled: bool,
     pub layout_columns_enabled: bool,
     pub layout_grid_enabled: bool,
@@ -277,7 +278,7 @@ impl Preferences {
             css_animations_testing_enabled: false,
             devtools_server_enabled: false,
             devtools_server_port: 0,
-            dom_abort_controller_enabled: false,
+            dom_abort_controller_enabled: true,
             dom_adoptedstylesheet_enabled: false,
             dom_allow_scripts_to_close_windows: false,
             dom_async_clipboard_enabled: false,
@@ -301,14 +302,14 @@ impl Preferences {
             dom_indexeddb_enabled: false,
             dom_intersection_observer_enabled: false,
             dom_microdata_testing_enabled: false,
-            dom_mouse_event_which_enabled: false,
+            dom_uievent_which_enabled: true,
             dom_mutation_observer_enabled: true,
             dom_navigator_sendbeacon_enabled: false,
             dom_notification_enabled: false,
             dom_offscreen_canvas_enabled: false,
             dom_permissions_enabled: false,
             dom_permissions_testing_allowed_in_nonsecure_contexts: false,
-            dom_resize_observer_enabled: false,
+            dom_resize_observer_enabled: true,
             dom_script_asynch: true,
             dom_serviceworker_enabled: false,
             dom_serviceworker_timeout_seconds: 60,
@@ -351,7 +352,6 @@ impl Preferences {
             dom_worklet_enabled: false,
             dom_worklet_testing_enabled: false,
             dom_worklet_timeout_ms: 10,
-            dom_xpath_enabled: false,
             fonts_default: String::new(),
             fonts_default_monospace_size: 13,
             fonts_default_size: 16,
@@ -405,6 +405,7 @@ impl Preferences {
             js_wasm_enabled: true,
             js_wasm_ion_enabled: true,
             js_werror_enabled: false,
+            largest_contentful_paint_enabled: false,
             layout_animations_test_enabled: false,
             layout_columns_enabled: false,
             layout_container_queries_enabled: false,
@@ -481,13 +482,8 @@ impl UserAgentPlatform {
             UserAgentPlatform::Desktop
                 if cfg!(all(target_os = "windows", target_arch = "x86_64")) =>
             {
-                #[cfg(target_arch = "x86_64")]
-                const ARCHITECTURE: &str = "x86; ";
-                #[cfg(not(target_arch = "x86_64"))]
-                const ARCHITECTURE: &str = "";
-
                 format!(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; {ARCHITECTURE}rv:140.0) Servo/{SERVO_VERSION} Firefox/140.0"
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; {ARCH}rv:140.0) Servo/{SERVO_VERSION} Firefox/140.0"
                 )
             },
             UserAgentPlatform::Desktop if cfg!(target_os = "macos") => {
@@ -496,14 +492,8 @@ impl UserAgentPlatform {
                 )
             },
             UserAgentPlatform::Desktop => {
-                #[cfg(target_arch = "x86_64")]
-                const ARCHITECTURE: &str = "x86_64";
-                // TODO: This is clearly wrong for other platforms.
-                #[cfg(not(target_arch = "x86_64"))]
-                const ARCHITECTURE: &str = "i686";
-
                 format!(
-                    "Mozilla/5.0 (X11; Linux {ARCHITECTURE}; rv:140.0) Servo/{SERVO_VERSION} Firefox/140.0"
+                    "Mozilla/5.0 (X11; Linux {ARCH}; rv:140.0) Servo/{SERVO_VERSION} Firefox/140.0"
                 )
             },
             UserAgentPlatform::Android => {

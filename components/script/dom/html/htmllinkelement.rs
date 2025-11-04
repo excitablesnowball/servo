@@ -38,7 +38,8 @@ use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::csp::{GlobalCspReporting, Violation};
-use crate::dom::cssstylesheet::CSSStyleSheet;
+use crate::dom::css::cssstylesheet::CSSStyleSheet;
+use crate::dom::css::stylesheet::StyleSheet as DOMStyleSheet;
 use crate::dom::document::Document;
 use crate::dom::documentorshadowroot::StylesheetSource;
 use crate::dom::domtokenlist::DOMTokenList;
@@ -50,11 +51,10 @@ use crate::dom::element::{
 use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::medialist::MediaList;
 use crate::dom::node::{BindContext, Node, NodeTraits, UnbindContext};
-use crate::dom::performanceresourcetiming::InitiatorType;
+use crate::dom::performance::performanceresourcetiming::InitiatorType;
 use crate::dom::processingoptions::{
     LinkFetchContext, LinkFetchContextType, LinkProcessingOptions,
 };
-use crate::dom::stylesheet::StyleSheet as DOMStyleSheet;
 use crate::dom::types::{EventTarget, GlobalScope};
 use crate::dom::virtualmethods::VirtualMethods;
 use crate::links::LinkRelations;
@@ -536,9 +536,11 @@ impl HTMLLinkElement {
         let fetch_context = LinkFetchContext {
             url,
             link: Some(Trusted::new(self)),
+            document: Trusted::new(&document),
             global: Trusted::new(&document.global()),
             resource_timing: ResourceFetchTiming::new(ResourceTimingType::Resource),
             type_: LinkFetchContextType::Prefetch,
+            response_body: vec![],
         };
 
         document.fetch_background(request, fetch_context);
@@ -800,34 +802,28 @@ impl HTMLLinkElement {
             }
         }
         // Step 6. Preload options, with the following steps given a response response:
-        let Some(request) = options.preload(self.owner_window().webview_id()) else {
-            return;
-        };
-        let url = request.url.clone();
         let document = self.upcast::<Node>().owner_doc();
-        let fetch_context = LinkFetchContext {
-            url,
-            link: Some(Trusted::new(self)),
-            global: Trusted::new(&document.global()),
-            resource_timing: ResourceFetchTiming::new(ResourceTimingType::Resource),
-            type_: LinkFetchContextType::Preload,
-        };
-        document.fetch_background(request, fetch_context);
+        options.preload(
+            self.owner_window().webview_id(),
+            Some(Trusted::new(self)),
+            &document,
+        );
     }
 
     /// <https://html.spec.whatwg.org/multipage/#link-type-preload:fetch-and-process-the-linked-resource-2>
     pub(crate) fn fire_event_after_response(
         &self,
         response: Result<ResourceFetchTiming, NetworkError>,
+        can_gc: CanGc,
     ) {
         // Step 3.1 If response is a network error, fire an event named error at el.
         // Otherwise, fire an event named load at el.
         if response.is_err() {
             self.upcast::<EventTarget>()
-                .fire_event(atom!("error"), CanGc::note());
+                .fire_event(atom!("error"), can_gc);
         } else {
             self.upcast::<EventTarget>()
-                .fire_event(atom!("load"), CanGc::note());
+                .fire_event(atom!("load"), can_gc);
         }
     }
 }
@@ -882,7 +878,7 @@ impl HTMLLinkElementMethods<crate::DomTypeHolder> for HTMLLinkElement {
     // https://html.spec.whatwg.org/multipage/#dom-link-rel
     make_getter!(Rel, "rel");
 
-    // https://html.spec.whatwg.org/multipage/#dom-link-rel
+    /// <https://html.spec.whatwg.org/multipage/#dom-link-rel>
     fn SetRel(&self, rel: DOMString, can_gc: CanGc) {
         self.upcast::<Element>()
             .set_tokenlist_attribute(&local_name!("rel"), rel, can_gc);
@@ -933,7 +929,7 @@ impl HTMLLinkElementMethods<crate::DomTypeHolder> for HTMLLinkElement {
     // https://html.spec.whatwg.org/multipage/#dom-link-disabled
     make_bool_setter!(SetDisabled, "disabled");
 
-    // https://html.spec.whatwg.org/multipage/#dom-link-rellist
+    /// <https://html.spec.whatwg.org/multipage/#dom-link-rellist>
     fn RelList(&self, can_gc: CanGc) -> DomRoot<DOMTokenList> {
         self.rel_list.or_init(|| {
             DOMTokenList::new(
@@ -979,17 +975,17 @@ impl HTMLLinkElementMethods<crate::DomTypeHolder> for HTMLLinkElement {
     // https://html.spec.whatwg.org/multipage/#dom-link-target
     make_setter!(SetTarget, "target");
 
-    // https://html.spec.whatwg.org/multipage/#dom-link-crossorigin
+    /// <https://html.spec.whatwg.org/multipage/#dom-link-crossorigin>
     fn GetCrossOrigin(&self) -> Option<DOMString> {
         reflect_cross_origin_attribute(self.upcast::<Element>())
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-link-crossorigin
+    /// <https://html.spec.whatwg.org/multipage/#dom-link-crossorigin>
     fn SetCrossOrigin(&self, value: Option<DOMString>, can_gc: CanGc) {
         set_cross_origin_attribute(self.upcast::<Element>(), value, can_gc);
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-link-referrerpolicy
+    /// <https://html.spec.whatwg.org/multipage/#dom-link-referrerpolicy>
     fn ReferrerPolicy(&self) -> DOMString {
         reflect_referrer_policy_attribute(self.upcast::<Element>())
     }
@@ -997,7 +993,7 @@ impl HTMLLinkElementMethods<crate::DomTypeHolder> for HTMLLinkElement {
     // https://html.spec.whatwg.org/multipage/#dom-link-referrerpolicy
     make_setter!(SetReferrerPolicy, "referrerpolicy");
 
-    // https://drafts.csswg.org/cssom/#dom-linkstyle-sheet
+    /// <https://drafts.csswg.org/cssom/#dom-linkstyle-sheet>
     fn GetSheet(&self, can_gc: CanGc) -> Option<DomRoot<DOMStyleSheet>> {
         self.get_cssom_stylesheet(can_gc).map(DomRoot::upcast)
     }

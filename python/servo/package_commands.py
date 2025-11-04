@@ -16,6 +16,7 @@ from github import Github
 import hashlib
 import io
 import json
+import re
 import os
 import os.path as path
 import shutil
@@ -63,10 +64,9 @@ PACKAGES = {
         r"production\msi\Servo.zip",
     ],
     "ohos": [
-        (
-            "openharmony/aarch64-unknown-linux-ohos/release/entry/build/"
-            "default/outputs/default/servoshell-default-signed.hap"
-        )
+        "openharmony/aarch64-unknown-linux-ohos/production/libservoshell.so",
+        "openharmony/aarch64-unknown-linux-ohos/production/entry/build/"
+        + "default/outputs/default/servoshell-default-signed.hap",
     ],
 }
 
@@ -136,10 +136,14 @@ class PackageCommands(CommandBase):
 
             if build_type.is_dev():
                 build_type_string = "Debug"
-            elif build_type.is_release():
+            elif build_type.is_release() or build_type.is_prod():
                 build_type_string = "Release"
             else:
-                raise Exception("TODO what should this be?")
+                print(f"Servo was built with custom cargo profile `{build_type.profile}`.")
+                print("Using Debug build for gradle.")
+                build_type_string = "Debug"
+            # Inform the android build of where `libservoshell.so` is located.
+            env["SERVO_TARGET_DIR"] = target_dir
 
             flavor_name = "Basic"
             if flavor is not None:
@@ -582,4 +586,47 @@ class PackageCommands(CommandBase):
             upload_to_s3(platform, package, package_hash, timestamp)
             upload_to_github_release(platform, package, package_hash)
 
+        return 0
+
+    @Command("bump-version", description="Bump Servo version", category="package")
+    @CommandArgument("target", type=str, help="Target version to bump to")
+    def bump_version(self, target: str) -> int:
+        # Todo: Also update assemblyIdentity.version in ports/servoshell/platform/windows/servo.exe.manifest
+        #   Note: assemblyIdentity requires 4 version components, while we usually use 3.
+        replacements = {
+            "ports/servoshell/Cargo.toml": r'^version ?= ?"(?P<version>.*?)"',
+            "support/windows/Servo.wxs.mako": r'<Product(.|\n)*Version="(?P<version>.*?)".*>',
+            "Info.plist": r"<key>CFBundleShortVersionString</key>\n\s*<string>(?P<version>.*?)</string>",
+            "support/android/apk/servoapp/build.gradle.kts": r'versionName\s*=\s*"(?P<version>.*?)"',
+            "support/openharmony/oh-package.json5": r'"version"\s*:\s*"(?P<version>.*?)"',
+            "support/openharmony/entry/oh-package.json5": r'"version"\s*:\s*"(?P<version>.*?)"',
+        }
+
+        for filename, expression in replacements.items():
+            filepath = path.join(self.get_top_dir(), filename)
+            with open(filepath, "r") as file:
+                content = file.read()
+
+            compiled_pattern = re.compile(expression, re.MULTILINE)
+
+            new_content, count = compiled_pattern.subn(
+                lambda m: m.group(0).replace(m.group("version"), target),
+                content,
+            )
+
+            if count == 0:
+                print(f"No occurrences found in {filename} to replace.")
+                return 1
+            elif count > 1:
+                print(f"Warning: Multiple ({count}) occurrences found in {filename}. Only one expected.")
+                # Print all occurrences for debugging
+                matches = compiled_pattern.findall(content)
+                for match in matches:
+                    print(f"Found occurrence: {match}")
+                return 1
+
+            with open(filepath, "w") as file:
+                file.write(new_content)
+
+            print(f"Updated occurrence in {filename}.")
         return 0

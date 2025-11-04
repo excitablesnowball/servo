@@ -87,7 +87,6 @@ impl DebuggerGlobalScope {
                 ServoUrl::parse_with_base(None, "about:internal/debugger")
                     .expect("Guaranteed by argument"),
                 None,
-                Default::default(),
                 #[cfg(feature = "webgpu")]
                 gpu_id_hub,
                 None,
@@ -152,6 +151,7 @@ impl DebuggerGlobalScope {
         debuggee_pipeline_id: PipelineId,
         debuggee_worker_id: Option<WorkerId>,
     ) {
+        let _realm = enter_realm(self);
         let debuggee_pipeline_id =
             crate::dom::pipelineid::PipelineId::new(self.upcast(), debuggee_pipeline_id, can_gc);
         let event = DomRoot::upcast::<Event>(DebuggerAddDebuggeeEvent::new(
@@ -178,6 +178,7 @@ impl DebuggerGlobalScope {
                 .replace(Some(result_sender))
                 .is_none()
         );
+        let _realm = enter_realm(self);
         let event = DomRoot::upcast::<Event>(DebuggerGetPossibleBreakpointsEvent::new(
             self.upcast(),
             spidermonkey_id,

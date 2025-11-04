@@ -21,7 +21,7 @@ use style::Atom;
 
 use crate::dom::attr::Attr;
 use crate::dom::bindings::codegen::Bindings::XPathNSResolverBinding::XPathNSResolver;
-use crate::dom::bindings::error::Error;
+use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::comment::Comment;
@@ -42,7 +42,6 @@ pub(crate) struct XPathImplementation;
 
 impl xpath::Dom for XPathImplementation {
     type Node = XPathWrapper<DomRoot<Node>>;
-    type JsError = Error;
     type NamespaceResolver = XPathWrapper<Rc<XPathNSResolver>>;
 }
 
@@ -258,15 +257,17 @@ impl xpath::Attribute for XPathWrapper<DomRoot<Attr>> {
     }
 }
 
-impl xpath::NamespaceResolver<Error> for XPathWrapper<Rc<XPathNSResolver>> {
-    fn resolve_namespace_prefix(&self, prefix: Option<&str>) -> Result<Option<String>, Error> {
+impl xpath::NamespaceResolver for XPathWrapper<Rc<XPathNSResolver>> {
+    fn resolve_namespace_prefix(&self, prefix: &str) -> Option<String> {
         self.0
             .LookupNamespaceURI__(
-                prefix.map(DOMString::from),
-                ExceptionHandling::Rethrow,
+                Some(DOMString::from(prefix)),
+                ExceptionHandling::Report,
                 CanGc::note(),
             )
-            .map(|result| result.map(String::from))
+            .ok()
+            .flatten()
+            .map(String::from)
     }
 }
 
@@ -286,4 +287,17 @@ impl<T> XPathWrapper<T> {
     pub(crate) fn into_inner(self) -> T {
         self.0
     }
+}
+
+pub(crate) fn parse_expression(
+    expression: &str,
+    resolver: Option<Rc<XPathNSResolver>>,
+    is_in_html_document: bool,
+) -> Fallible<xpath::Expression> {
+    xpath::parse(expression, resolver.map(XPathWrapper), is_in_html_document).map_err(|error| {
+        match error {
+            xpath::ParserError::FailedToResolveNamespacePrefix => Error::Namespace,
+            _ => Error::Syntax(Some(format!("Failed to parse XPath expression: {error:?}"))),
+        }
+    })
 }

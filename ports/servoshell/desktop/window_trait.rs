@@ -10,18 +10,16 @@ use std::rc::Rc;
 use euclid::{Length, Scale};
 use servo::servo_geometry::{DeviceIndependentIntRect, DeviceIndependentPixel};
 use servo::webrender_api::units::{DeviceIntPoint, DeviceIntSize, DevicePixel};
-use servo::{Cursor, InputEventId, InputEventResult, RenderingContext, ScreenGeometry, WebView};
+use servo::{
+    Cursor, InputEventId, InputEventResult, InputMethodControl, RenderingContext, ScreenGeometry,
+    WebView,
+};
 
 use super::app_state::RunningAppState;
 
 // This should vary by zoom level and maybe actual text size (focused or under cursor)
 pub(crate) const LINE_HEIGHT: f32 = 76.0;
 pub(crate) const LINE_WIDTH: f32 = 76.0;
-
-// MouseScrollDelta::PixelDelta is default for MacOS, which is high precision and very slow
-// in winit. Therefore we use a factor of 4.0 to make it more usable.
-// See https://github.com/servo/servo/pull/34063#discussion_r2197729507
-pub(crate) const PIXEL_DELTA_FACTOR: f64 = 4.0;
 
 /// <https://github.com/web-platform-tests/wpt/blob/9320b1f724632c52929a3fdb11bdaf65eafc7611/webdriver/tests/classic/set_window_rect/set.py#L287-L290>
 /// "A window size of 10x10px shouldn't be supported by any browser."
@@ -35,6 +33,9 @@ pub trait WindowPortsMethods {
     fn get_fullscreen(&self) -> bool;
     fn handle_winit_event(&self, state: Rc<RunningAppState>, event: winit::event::WindowEvent);
     fn set_title(&self, _title: &str) {}
+    fn set_title_if_changed(&self, _title: &str) -> bool {
+        false
+    }
     /// Request a new outer size for the window, including external decorations.
     /// This should be the same as `window.outerWidth` and `window.outerHeight``
     fn request_resize(&self, webview: &WebView, outer_size: DeviceIntSize)
@@ -52,14 +53,7 @@ pub trait WindowPortsMethods {
     fn set_toolbar_height(&self, height: Length<f32, DeviceIndependentPixel>);
     /// This returns [`RenderingContext`] matching the viewport.
     fn rendering_context(&self) -> Rc<dyn RenderingContext>;
-    fn show_ime(
-        &self,
-        _input_type: servo::InputMethodType,
-        _text: Option<(String, i32)>,
-        _multiline: bool,
-        _position: servo::webrender_api::units::DeviceIntRect,
-    ) {
-    }
+    fn show_ime(&self, _input_method: InputMethodControl) {}
     fn hide_ime(&self) {}
     fn theme(&self) -> servo::Theme {
         servo::Theme::Light

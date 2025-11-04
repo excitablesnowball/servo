@@ -25,8 +25,8 @@ use canvas_traits::webgl::{
     WebGLVersion, WebGLVertexArrayId, YAxisTreatment,
 };
 use compositing_traits::{
-    CrossProcessCompositorApi, SerializableImageData, WebrenderExternalImageRegistry,
-    WebrenderImageHandlerType,
+    CrossProcessCompositorApi, SerializableImageData, WebRenderExternalImageRegistry,
+    WebRenderImageHandlerType,
 };
 use euclid::default::Size2D;
 use glow::{
@@ -45,7 +45,6 @@ use surfman::{
     self, Adapter, Connection, Context, ContextAttributeFlags, ContextAttributes, Device,
     GLVersion, SurfaceAccess, SurfaceInfo, SurfaceType,
 };
-use webrender::{RenderApi, RenderApiSender};
 use webrender_api::units::DeviceIntSize;
 use webrender_api::{
     ExternalImageData, ExternalImageId, ExternalImageType, ImageBufferKind, ImageDescriptor,
@@ -208,7 +207,6 @@ pub(crate) struct WebGLThread {
     device: Device,
     /// Channel used to generate/update or delete `ImageKey`s.
     compositor_api: CrossProcessCompositorApi,
-    webrender_api: RenderApi,
     /// Map of live WebGLContexts.
     contexts: FxHashMap<WebGLContextId, GLContextData>,
     /// Cached information for WebGLContexts.
@@ -217,7 +215,7 @@ pub(crate) struct WebGLThread {
     bound_context_id: Option<WebGLContextId>,
     /// List of registered webrender external images.
     /// We use it to get an unique ID for new WebGLContexts.
-    external_images: Arc<Mutex<WebrenderExternalImageRegistry>>,
+    external_images: Arc<Mutex<WebRenderExternalImageRegistry>>,
     /// The receiver that will be used for processing WebGL messages.
     receiver: RoutedReceiver<WebGLMsg>,
     /// The receiver that should be used to send WebGL messages for processing.
@@ -234,8 +232,7 @@ pub(crate) struct WebGLThread {
 /// The data required to initialize an instance of the WebGLThread type.
 pub(crate) struct WebGLThreadInit {
     pub compositor_api: CrossProcessCompositorApi,
-    pub webrender_api_sender: RenderApiSender,
-    pub external_images: Arc<Mutex<WebrenderExternalImageRegistry>>,
+    pub external_images: Arc<Mutex<WebRenderExternalImageRegistry>>,
     pub sender: WebGLSender<WebGLMsg>,
     pub receiver: WebGLReceiver<WebGLMsg>,
     pub webrender_swap_chains: SwapChains<WebGLContextId, Device>,
@@ -254,7 +251,6 @@ impl WebGLThread {
     pub(crate) fn new(
         WebGLThreadInit {
             compositor_api,
-            webrender_api_sender,
             external_images,
             sender,
             receiver,
@@ -271,7 +267,6 @@ impl WebGLThread {
                 .create_device(&adapter)
                 .expect("Couldn't open WebGL device!"),
             compositor_api,
-            webrender_api: webrender_api_sender.create_api(),
             contexts: Default::default(),
             cached_context_info: Default::default(),
             bound_context_id: None,
@@ -392,8 +387,6 @@ impl WebGLThread {
                     self.remove_webgl_context(id);
                 }
 
-                // Block on shutting-down WebRender.
-                self.webrender_api.shut_down(true);
                 if let Err(e) = sender.send(()) {
                     warn!("Failed to send response to WebGLMsg::Exit ({e})");
                 }
@@ -557,7 +550,7 @@ impl WebGLThread {
             self.external_images
                 .lock()
                 .expect("Lock poisoned?")
-                .next_id(WebrenderImageHandlerType::WebGL)
+                .next_id(WebRenderImageHandlerType::WebGl)
                 .0,
         );
 
@@ -2617,7 +2610,7 @@ impl WebGLImpl {
         let _ = result_sender.send(gl.supported_extensions().iter().join(" "));
     }
 
-    // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.6
+    /// <https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.6>
     fn get_framebuffer_attachment_parameter(
         gl: &Gl,
         target: u32,
@@ -2630,7 +2623,7 @@ impl WebGLImpl {
         chan.send(parameter).unwrap();
     }
 
-    // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.7
+    /// <https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.7>
     fn get_renderbuffer_parameter(gl: &Gl, target: u32, pname: u32, chan: &WebGLSender<i32>) {
         let parameter = unsafe { gl.get_renderbuffer_parameter_i32(target, pname) };
         chan.send(parameter).unwrap();

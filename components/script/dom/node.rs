@@ -27,7 +27,7 @@ use js::rust::HandleObject;
 use keyboard_types::Modifiers;
 use layout_api::{
     BoxAreaType, GenericLayoutData, HTMLCanvasData, HTMLMediaData, LayoutElementType,
-    LayoutNodeType, QueryMsg, SVGElementData, StyleData, TrustedNodeAddress,
+    LayoutNodeType, PhysicalSides, QueryMsg, SVGElementData, StyleData, TrustedNodeAddress,
 };
 use libc::{self, c_void, uintptr_t};
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
@@ -86,7 +86,8 @@ use crate::dom::bindings::reflector::{DomObject, DomObjectWrap, reflect_dom_obje
 use crate::dom::bindings::root::{Dom, DomRoot, DomSlice, LayoutDom, MutNullableDom, ToLayout};
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::characterdata::{CharacterData, LayoutCharacterDataHelpers};
-use crate::dom::cssstylesheet::CSSStyleSheet;
+use crate::dom::css::cssstylesheet::CSSStyleSheet;
+use crate::dom::css::stylesheetlist::StyleSheetListOwner;
 use crate::dom::customelementregistry::{CallbackReaction, try_upgrade_element};
 use crate::dom::document::{Document, DocumentSource, HasBrowsingContext, IsHTMLDocument};
 use crate::dom::documentfragment::DocumentFragment;
@@ -118,8 +119,7 @@ use crate::dom::range::WeakRangeVec;
 use crate::dom::raredata::NodeRareData;
 use crate::dom::servoparser::{ServoParser, serialize_html_fragment};
 use crate::dom::shadowroot::{IsUserAgentWidget, LayoutShadowRootHelpers, ShadowRoot};
-use crate::dom::stylesheetlist::StyleSheetListOwner;
-use crate::dom::svgsvgelement::{LayoutSVGSVGElementHelpers, SVGSVGElement};
+use crate::dom::svg::svgsvgelement::{LayoutSVGSVGElementHelpers, SVGSVGElement};
 use crate::dom::text::Text;
 use crate::dom::types::KeyboardEvent;
 use crate::dom::virtualmethods::{VirtualMethods, vtable_for};
@@ -301,7 +301,7 @@ impl Node {
         let parent_is_connected = self.is_connected();
         let parent_is_in_ua_widget = self.is_in_ua_widget();
 
-        let context = BindContext::new(self);
+        let context = BindContext::new(self, IsShadowTree::No);
 
         for node in new_child.traverse_preorder(ShadowIncluding::No) {
             if parent_in_shadow_tree {
@@ -386,14 +386,17 @@ impl Node {
         // Step 12.
         let is_parent_connected = context.parent.is_connected();
         let custom_element_reaction_stack = ScriptThread::custom_element_reaction_stack();
-        for node in root.traverse_preorder(ShadowIncluding::Yes) {
+
+        // Since both the initial traversal in light dom and the inner traversal
+        // in shadow DOM share the same code, we define a closure to prevent omissions.
+        let cleanup_node = |node: &Node| {
             node.clean_up_style_and_layout_data();
 
             // Step 11 & 14.1. Run the removing steps.
             // This needs to be in its own loop, because unbind_from_tree may
             // rely on the state of IS_IN_DOC of the context node's descendants,
             // e.g. when removing a <form>.
-            vtable_for(&node).unbind_from_tree(context, can_gc);
+            vtable_for(node).unbind_from_tree(context, can_gc);
 
             // Step 12 & 14.2. Enqueue disconnected custom element reactions.
             if is_parent_connected {
@@ -403,6 +406,29 @@ impl Node {
                         CallbackReaction::Disconnected,
                         None,
                     );
+                }
+            }
+        };
+
+        for node in root.traverse_preorder(ShadowIncluding::No) {
+            cleanup_node(&node);
+
+            // Make sure that we don't accidentally initialize the rare data for this node
+            // by setting it to None
+            if node.containing_shadow_root().is_some() {
+                // Reset the containing shadowRoot after we unbind the node, since some elements
+                // require the containing shadowRoot for cleanup logic (e.g. <style>).
+                node.set_containing_shadow_root(None);
+            }
+
+            // If the element has a shadow root attached to it then we traverse that as well,
+            // but without resetting the contained shadow root
+            if let Some(shadow_root) = node.downcast::<Element>().and_then(Element::shadow_root) {
+                for node in shadow_root
+                    .upcast::<Node>()
+                    .traverse_preorder(ShadowIncluding::Yes)
+                {
+                    cleanup_node(&node);
                 }
             }
         }
@@ -942,19 +968,23 @@ impl Node {
         TrustedNodeAddress(self as *const Node as *const libc::c_void)
     }
 
+    pub(crate) fn padding(&self) -> Option<PhysicalSides> {
+        self.owner_window().padding_query_without_reflow(self)
+    }
+
     pub(crate) fn content_box(&self) -> Option<Rect<Au>> {
         self.owner_window()
-            .box_area_query(self, BoxAreaType::Content)
+            .box_area_query(self, BoxAreaType::Content, false)
     }
 
     pub(crate) fn border_box(&self) -> Option<Rect<Au>> {
         self.owner_window()
-            .box_area_query(self, BoxAreaType::Border)
+            .box_area_query(self, BoxAreaType::Border, false)
     }
 
     pub(crate) fn padding_box(&self) -> Option<Rect<Au>> {
         self.owner_window()
-            .box_area_query(self, BoxAreaType::Padding)
+            .box_area_query(self, BoxAreaType::Padding, false)
     }
 
     pub(crate) fn border_boxes(&self) -> Vec<Rect<Au>> {
@@ -1493,13 +1523,12 @@ impl Node {
     /// <https://dom.spec.whatwg.org/#assign-slotables-for-a-tree>
     pub(crate) fn assign_slottables_for_a_tree(&self) {
         // NOTE: This method traverses all descendants of the node and is potentially very
-        // expensive. If the node is not a shadow root then assigning slottables to it won't
-        // have any effect, so we take a fast path out.
-        let Some(shadow_root) = self.downcast::<ShadowRoot>() else {
-            return;
-        };
-
-        if !shadow_root.has_slot_descendants() {
+        // expensive. If the node is neither a shadowroot nor a slot then assigning slottables
+        // for it won't have any effect, so we take a fast path out.
+        let is_shadow_root_with_slots = self
+            .downcast::<ShadowRoot>()
+            .is_some_and(|shadow_root| shadow_root.has_slot_descendants());
+        if !is_shadow_root_with_slots && !self.is::<HTMLSlotElement>() {
             return;
         }
 
@@ -2509,7 +2538,8 @@ impl Node {
             for kid in new_nodes {
                 Node::remove(kid, node, SuppressObserver::Suppressed, can_gc);
             }
-            vtable_for(node).children_changed(&ChildrenMutation::replace_all(new_nodes, &[]));
+            vtable_for(node)
+                .children_changed(&ChildrenMutation::replace_all(new_nodes, &[]), can_gc);
 
             // Step 4.2. Queue a tree mutation record for node with « », nodes, null, and null.
             let mutation = LazyCell::new(|| Mutation::ChildList {
@@ -2558,8 +2588,8 @@ impl Node {
             if let Some(shadow_root) = parent.downcast::<Element>().and_then(Element::shadow_root) {
                 if shadow_root.SlotAssignment() == SlotAssignmentMode::Named {
                     let cx = GlobalScope::get_cx();
-                    if node.is::<Element>() || node.is::<Text>() {
-                        rooted!(in(*cx) let slottable = Slottable(Dom::from_ref(node)));
+                    if kid.is::<Element>() || kid.is::<Text>() {
+                        rooted!(in(*cx) let slottable = Slottable(Dom::from_ref(kid)));
                         slottable.assign_a_slot();
                     }
                 }
@@ -2607,11 +2637,10 @@ impl Node {
         if let SuppressObserver::Unsuppressed = suppress_observers {
             // Step 9. Run the children changed steps for parent.
             // TODO(xiaochengh): If we follow the spec and move it out of the if block, some WPT fail. Investigate.
-            vtable_for(parent).children_changed(&ChildrenMutation::insert(
-                previous_sibling.as_deref(),
-                new_nodes,
-                child,
-            ));
+            vtable_for(parent).children_changed(
+                &ChildrenMutation::insert(previous_sibling.as_deref(), new_nodes, child),
+                can_gc,
+            );
 
             // Step 8. If suppress observers flag is unset, then queue a tree mutation record for parent
             // with nodes, « », previousSibling, and child.
@@ -2649,7 +2678,7 @@ impl Node {
                 // Step 12. For each node of staticNodeList, if node is connected, then run the
                 //          post-connection steps with node.
                 for node in static_node_list.iter().filter(|n| n.is_connected()) {
-                    vtable_for(node).post_connection_steps();
+                    vtable_for(node).post_connection_steps(CanGc::note());
                 }
             }),
         );
@@ -2688,10 +2717,10 @@ impl Node {
             Node::insert(node, parent, None, SuppressObserver::Suppressed, can_gc);
         }
         // Step 6.
-        vtable_for(parent).children_changed(&ChildrenMutation::replace_all(
-            removed_nodes.r(),
-            added_nodes,
-        ));
+        vtable_for(parent).children_changed(
+            &ChildrenMutation::replace_all(removed_nodes.r(), added_nodes),
+            can_gc,
+        );
 
         if !removed_nodes.is_empty() || !added_nodes.is_empty() {
             let mutation = LazyCell::new(|| Mutation::ChildList {
@@ -2816,12 +2845,15 @@ impl Node {
 
         // Step 16.
         if let SuppressObserver::Unsuppressed = suppress_observers {
-            vtable_for(parent).children_changed(&ChildrenMutation::replace(
-                old_previous_sibling.as_deref(),
-                &Some(node),
-                &[],
-                old_next_sibling.as_deref(),
-            ));
+            vtable_for(parent).children_changed(
+                &ChildrenMutation::replace(
+                    old_previous_sibling.as_deref(),
+                    &Some(node),
+                    &[],
+                    old_next_sibling.as_deref(),
+                ),
+                can_gc,
+            );
 
             let removed = [node];
             let mutation = LazyCell::new(|| Mutation::ChildList {
@@ -3611,12 +3643,15 @@ impl NodeMethods<crate::DomTypeHolder> for Node {
             can_gc,
         );
 
-        vtable_for(self).children_changed(&ChildrenMutation::replace(
-            previous_sibling.as_deref(),
-            &removed_child,
-            nodes,
-            reference_child,
-        ));
+        vtable_for(self).children_changed(
+            &ChildrenMutation::replace(
+                previous_sibling.as_deref(),
+                &removed_child,
+                nodes,
+                reference_child,
+            ),
+            can_gc,
+        );
 
         // Step 14. Queue a tree mutation record for parent with nodes, removedNodes,
         // previousSibling, and referenceChild.
@@ -4059,9 +4094,9 @@ impl VirtualMethods for Node {
         Some(self.upcast::<EventTarget>() as &dyn VirtualMethods)
     }
 
-    fn children_changed(&self, mutation: &ChildrenMutation) {
+    fn children_changed(&self, mutation: &ChildrenMutation, can_gc: CanGc) {
         if let Some(s) = self.super_type() {
-            s.children_changed(mutation);
+            s.children_changed(mutation, can_gc);
         }
 
         if let Some(data) = self.rare_data().as_ref() {
@@ -4280,16 +4315,29 @@ pub(crate) struct BindContext<'a> {
 
     /// Whether the tree's root is a shadow root
     pub(crate) tree_is_in_a_shadow_tree: bool,
+
+    /// Whether the root of the subtree that is being bound to the parent is a shadow root.
+    ///
+    /// This implies that all elements whose "bind_to_tree" method are called were already
+    /// in a shadow tree beforehand.
+    pub(crate) is_shadow_tree: IsShadowTree,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum IsShadowTree {
+    Yes,
+    No,
 }
 
 impl<'a> BindContext<'a> {
     /// Create a new `BindContext` value.
-    pub(crate) fn new(parent: &'a Node) -> Self {
+    pub(crate) fn new(parent: &'a Node, is_shadow_tree: IsShadowTree) -> Self {
         BindContext {
             parent,
             tree_connected: parent.is_connected(),
             tree_is_in_a_document_tree: parent.is_in_a_document_tree(),
             tree_is_in_a_shadow_tree: parent.is_in_a_shadow_tree(),
+            is_shadow_tree,
         }
     }
 

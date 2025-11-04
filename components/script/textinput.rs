@@ -11,6 +11,7 @@ use std::ops::{Add, AddAssign, Range};
 
 use bitflags::bitflags;
 use keyboard_types::{Key, KeyState, Modifiers, NamedKey, ShortcutMatcher};
+use script_bindings::match_domstring_ascii;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::clipboard_provider::ClipboardProvider;
@@ -132,11 +133,11 @@ impl AddAssign for UTF16CodeUnits {
 
 impl From<DOMString> for SelectionDirection {
     fn from(direction: DOMString) -> SelectionDirection {
-        match &*direction.str() {
+        match_domstring_ascii!(direction,
             "forward" => SelectionDirection::Forward,
             "backward" => SelectionDirection::Backward,
             _ => SelectionDirection::None,
-        }
+        )
     }
 }
 
@@ -1360,7 +1361,8 @@ impl<T: ClipboardProvider> TextInput<T> {
             return ClipboardEventReaction::empty();
         }
 
-        match &*event.Type().str() {
+        let event_type = event.Type();
+        match_domstring_ascii!(event_type,
             "copy" => {
                 // These steps are from <https://www.w3.org/TR/clipboard-apis/#copy-action>:
                 let selection = self.get_selection_text();
@@ -1437,8 +1439,7 @@ impl<T: ClipboardProvider> TextInput<T> {
                     .with_text(text_content)
                     .with_input_type(InputType::InsertFromPaste)
             },
-            _ => ClipboardEventReaction::empty(),
-        }
+        _ => ClipboardEventReaction::empty(),)
     }
 
     /// <https://w3c.github.io/uievents/#event-type-input>

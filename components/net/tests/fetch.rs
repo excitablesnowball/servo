@@ -7,6 +7,7 @@
 use std::fs;
 use std::iter::FromIterator;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
@@ -18,8 +19,8 @@ use crossbeam_channel::{Sender, unbounded};
 use devtools_traits::{HttpRequest as DevtoolsHttpRequest, HttpResponse as DevtoolsHttpResponse};
 use headers::{
     AccessControlAllowCredentials, AccessControlAllowHeaders, AccessControlAllowMethods,
-    AccessControlAllowOrigin, AccessControlMaxAge, CacheControl, ContentLength, ContentType,
-    Expires, HeaderMapExt, LastModified, Pragma, StrictTransportSecurity, UserAgent,
+    AccessControlAllowOrigin, AccessControlMaxAge, CacheControl, ContentLength, ContentType, ETag,
+    Expires, HeaderMapExt, IfNoneMatch, LastModified, Pragma, StrictTransportSecurity, UserAgent,
 };
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http::{Method, StatusCode};
@@ -46,14 +47,14 @@ use net_traits::{
     ResourceTimingType,
 };
 use servo_arc::Arc as ServoArc;
-use servo_url::ServoUrl;
+use servo_url::{ImmutableOrigin, ServoUrl};
 use uuid::Uuid;
 
 use crate::http_loader::{devtools_response_with_body, expect_devtools_http_request};
 use crate::{
     DEFAULT_USER_AGENT, create_embedder_proxy, create_embedder_proxy_and_receiver,
     create_http_state, fetch, fetch_with_context, fetch_with_cors_cache, make_body, make_server,
-    make_ssl_server, new_fetch_context,
+    make_ssl_server, mock_origin, new_fetch_context,
 };
 
 // TODO write a struct that impls Handler for storing test values
@@ -415,6 +416,7 @@ fn test_cors_preflight_cache_fetch() {
 
     let mut request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url, Referrer::NoReferrer)
         .policy_container(Default::default())
+        .origin(mock_origin())
         .build();
     request.use_cors_preflight = true;
     request.mode = RequestMode::CorsMode;
@@ -486,6 +488,7 @@ fn test_cors_preflight_fetch_network_error() {
 
     let mut request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url, Referrer::NoReferrer)
         .policy_container(Default::default())
+        .origin(mock_origin())
         .build();
     request.method = Method::from_bytes(b"CHICKEN").unwrap();
     request.use_cors_preflight = true;
@@ -585,6 +588,7 @@ fn test_fetch_response_is_cors_filtered() {
     // an origin mis-match will stop it from defaulting to a basic filtered response
     let mut request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url, Referrer::NoReferrer)
         .policy_container(Default::default())
+        .origin(mock_origin())
         .build();
     request.mode = RequestMode::CorsMode;
     let fetch_response = fetch(request, None);
@@ -623,6 +627,7 @@ fn test_fetch_response_is_opaque_filtered() {
     // an origin mis-match will fall through to an Opaque filtered response
     let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url, Referrer::NoReferrer)
         .policy_container(Default::default())
+        .origin(ImmutableOrigin::new_opaque())
         .build();
     let fetch_response = fetch(request, None);
     let _ = server.close();
@@ -1257,6 +1262,83 @@ fn test_fetch_async_returns_complete_response() {
 }
 
 #[test]
+fn test_response_cache_status_is_local() {
+    static MESSAGE: &'static [u8] = b"cacheable content";
+    let handler =
+        move |_: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            // Mark this response as cacheable.
+            response
+                .headers_mut()
+                .typed_insert(CacheControl::new().with_max_age(Duration::from_secs(604800)));
+            *response.body_mut() = make_body(MESSAGE.to_vec());
+        };
+    let (server, url) = make_server(handler);
+
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
+        .origin(url.origin())
+        .policy_container(Default::default())
+        .build();
+
+    // Use the same HttpCache for both fetches.
+    let mut context = new_fetch_context(None, None, None);
+
+    // Cold request - response should come from the server.
+    let initial_response = fetch_with_context(request.clone(), &mut context);
+    assert!(matches!(initial_response.cache_state, CacheState::None));
+
+    // Warm request - response should come from the cache.
+    let cached_response = fetch_with_context(request.clone(), &mut context);
+    assert!(matches!(cached_response.cache_state, CacheState::Local));
+
+    let _ = server.close();
+}
+
+#[test]
+fn test_response_cache_status_is_validated() {
+    static MESSAGE: &'static [u8] = b"cacheable content";
+    let handler =
+        move |request: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            // Check for the revalidation request.
+            if let Some(_) = request.headers().typed_get::<IfNoneMatch>() {
+                *response.status_mut() = StatusCode::NOT_MODIFIED;
+                return;
+            }
+            // Mark this cacheable reponse as requiring revalidation upon refetch.
+            response
+                .headers_mut()
+                .typed_insert(CacheControl::new().with_no_cache());
+            response
+                .headers_mut()
+                .typed_insert(ETag::from_str("\"1234abcd\"").unwrap());
+            *response.body_mut() = make_body(MESSAGE.to_vec());
+        };
+    let (server, url) = make_server(handler);
+
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
+        .origin(url.origin())
+        .policy_container(Default::default())
+        .build();
+
+    // Use the same HttpCache for both fetches.
+    let mut context = new_fetch_context(None, None, None);
+
+    // Cold request - response should come from the server.
+    let initial_response = fetch_with_context(request.clone(), &mut context);
+    assert!(matches!(initial_response.cache_state, CacheState::None));
+
+    // Warm request - response should come from the cache after revalidation with server.
+    let revalidated_response = fetch_with_context(request, &mut context);
+    assert!(matches!(
+        revalidated_response.cache_state,
+        CacheState::Validated
+    ));
+
+    let _ = server.close();
+}
+
+#[test]
 fn test_opaque_filtered_fetch_async_returns_complete_response() {
     static MESSAGE: &'static [u8] = b"";
     let handler =
@@ -1269,6 +1351,7 @@ fn test_opaque_filtered_fetch_async_returns_complete_response() {
     // an origin mis-match will fall through to an Opaque filtered response
     let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url, Referrer::NoReferrer)
         .policy_container(Default::default())
+        .origin(ImmutableOrigin::new_opaque())
         .build();
     let fetch_response = fetch(request, None);
 
@@ -1404,6 +1487,7 @@ fn test_fetch_with_devtools() {
         headers: Some(response_headers),
         status: HttpStatus::default(),
         body: Some(content.as_bytes().to_vec()),
+        from_cache: false,
         pipeline_id: TEST_PIPELINE_ID,
         browsing_context_id: TEST_WEBVIEW_ID.into(),
     };
@@ -1486,8 +1570,7 @@ fn test_fetch_request_intercepted() {
         response
             .headers
             .get(HEADERNAME)
-            .map(|v| v == HEADERVALUE)
-            .unwrap_or(false),
+            .is_some_and(|value| value == HEADERVALUE),
         "The custom header does not exist or has an incorrect value!"
     );
 

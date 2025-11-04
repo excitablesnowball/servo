@@ -12,6 +12,7 @@ use js::jsval::UndefinedValue;
 use js::rust::CustomAutoRooterGuard;
 use js::typedarray::{ArrayBuffer, ArrayBufferView, CreateWith};
 use script_bindings::conversions::SafeToJSValConvertible;
+use script_bindings::match_domstring_ascii;
 use script_bindings::weakref::WeakRef;
 use servo_media::webrtc::{
     DataChannelId, DataChannelInit, DataChannelMessage, DataChannelState, WebRtcError,
@@ -202,33 +203,34 @@ impl RTCDataChannel {
 
         match channel_message {
             DataChannelMessage::Text(text) => {
-                text.safe_to_jsval(cx, message.handle_mut());
+                text.safe_to_jsval(cx, message.handle_mut(), can_gc);
             },
-            DataChannelMessage::Binary(data) => match &*self.binary_type.borrow().str() {
-                "blob" => {
-                    let blob = Blob::new(
-                        &global,
-                        BlobImpl::new_from_bytes(data, "".to_owned()),
-                        can_gc,
-                    );
-                    blob.safe_to_jsval(cx, message.handle_mut());
-                },
-                "arraybuffer" => {
-                    rooted!(in(*cx) let mut array_buffer = ptr::null_mut::<JSObject>());
-                    unsafe {
-                        assert!(
-                            ArrayBuffer::create(
-                                *cx,
-                                CreateWith::Slice(&data),
-                                array_buffer.handle_mut()
+            DataChannelMessage::Binary(data) => {
+                let binary_type = self.binary_type.borrow();
+                match_domstring_ascii!(binary_type,
+                    "blob" => {
+                        let blob = Blob::new(
+                            &global,
+                            BlobImpl::new_from_bytes(data, "".to_owned()),
+                            can_gc,
+                        );
+                        blob.safe_to_jsval(cx, message.handle_mut(), can_gc);
+                    },
+                    "arraybuffer" => {
+                        rooted!(in(*cx) let mut array_buffer = ptr::null_mut::<JSObject>());
+                        unsafe {
+                            assert!(
+                                ArrayBuffer::create(
+                                    *cx,
+                                    CreateWith::Slice(&data),
+                                    array_buffer.handle_mut()
+                                )
+                                .is_ok()
                             )
-                            .is_ok()
-                        )
-                    };
-
-                    (*array_buffer).safe_to_jsval(cx, message.handle_mut());
+                        };
+                        (*array_buffer).safe_to_jsval(cx, message.handle_mut(), can_gc);
                 },
-                _ => unreachable!(),
+            _ => unreachable!(),)
             },
         }
 
@@ -306,41 +308,41 @@ impl RTCDataChannelMethods<crate::DomTypeHolder> for RTCDataChannel {
     // https://www.w3.org/TR/webrtc/#dom-rtcdatachannel-onmessage
     event_handler!(message, GetOnmessage, SetOnmessage);
 
-    // https://www.w3.org/TR/webrtc/#dom-datachannel-label
+    /// <https://www.w3.org/TR/webrtc/#dom-datachannel-label>
     fn Label(&self) -> USVString {
         self.label.clone()
     }
-    // https://www.w3.org/TR/webrtc/#dom-datachannel-ordered
+    /// <https://www.w3.org/TR/webrtc/#dom-datachannel-ordered>
     fn Ordered(&self) -> bool {
         self.ordered
     }
 
-    // https://www.w3.org/TR/webrtc/#dom-datachannel-maxpacketlifetime
+    /// <https://www.w3.org/TR/webrtc/#dom-datachannel-maxpacketlifetime>
     fn GetMaxPacketLifeTime(&self) -> Option<u16> {
         self.max_packet_life_time
     }
 
-    // https://www.w3.org/TR/webrtc/#dom-datachannel-maxretransmits
+    /// <https://www.w3.org/TR/webrtc/#dom-datachannel-maxretransmits>
     fn GetMaxRetransmits(&self) -> Option<u16> {
         self.max_retransmits
     }
 
-    // https://www.w3.org/TR/webrtc/#dom-datachannel-protocol
+    /// <https://www.w3.org/TR/webrtc/#dom-datachannel-protocol>
     fn Protocol(&self) -> USVString {
         self.protocol.clone()
     }
 
-    // https://www.w3.org/TR/webrtc/#dom-datachannel-negotiated
+    /// <https://www.w3.org/TR/webrtc/#dom-datachannel-negotiated>
     fn Negotiated(&self) -> bool {
         self.negotiated
     }
 
-    // https://www.w3.org/TR/webrtc/#dom-rtcdatachannel-id
+    /// <https://www.w3.org/TR/webrtc/#dom-rtcdatachannel-id>
     fn GetId(&self) -> Option<u16> {
         self.id
     }
 
-    // https://www.w3.org/TR/webrtc/#dom-datachannel-readystate
+    /// <https://www.w3.org/TR/webrtc/#dom-datachannel-readystate>
     fn ReadyState(&self) -> RTCDataChannelState {
         self.ready_state.get()
     }
@@ -352,7 +354,7 @@ impl RTCDataChannelMethods<crate::DomTypeHolder> for RTCDataChannel {
     //    fn BufferedAmountLowThreshold(&self) -> u32;
     //    fn SetBufferedAmountLowThreshold(&self, value: u32) -> ();
 
-    // https://www.w3.org/TR/webrtc/#dom-rtcdatachannel-close
+    /// <https://www.w3.org/TR/webrtc/#dom-rtcdatachannel-close>
     fn Close(&self) {
         let controller = self.peer_connection.get_webrtc_controller().borrow();
         controller
@@ -361,12 +363,12 @@ impl RTCDataChannelMethods<crate::DomTypeHolder> for RTCDataChannel {
             .close_data_channel(&self.get_servo_media_id());
     }
 
-    // https://www.w3.org/TR/webrtc/#dom-datachannel-binarytype
+    /// <https://www.w3.org/TR/webrtc/#dom-datachannel-binarytype>
     fn BinaryType(&self) -> DOMString {
         self.binary_type.borrow().clone()
     }
 
-    // https://www.w3.org/TR/webrtc/#dom-datachannel-binarytype
+    /// <https://www.w3.org/TR/webrtc/#dom-datachannel-binarytype>
     fn SetBinaryType(&self, value: DOMString) -> Fallible<()> {
         if value != "blob" || value != "arraybuffer" {
             return Err(Error::Syntax(None));
@@ -375,22 +377,22 @@ impl RTCDataChannelMethods<crate::DomTypeHolder> for RTCDataChannel {
         Ok(())
     }
 
-    // https://www.w3.org/TR/webrtc/#dom-rtcdatachannel-send
+    /// <https://www.w3.org/TR/webrtc/#dom-rtcdatachannel-send>
     fn Send(&self, data: USVString) -> Fallible<()> {
         self.send(&SendSource::String(&data))
     }
 
-    // https://www.w3.org/TR/webrtc/#dom-rtcdatachannel-send!overload-1
+    /// <https://www.w3.org/TR/webrtc/#dom-rtcdatachannel-send!overload-1>
     fn Send_(&self, data: &Blob) -> Fallible<()> {
         self.send(&SendSource::Blob(data))
     }
 
-    // https://www.w3.org/TR/webrtc/#dom-rtcdatachannel-send!overload-2
+    /// <https://www.w3.org/TR/webrtc/#dom-rtcdatachannel-send!overload-2>
     fn Send__(&self, data: CustomAutoRooterGuard<ArrayBuffer>) -> Fallible<()> {
         self.send(&SendSource::ArrayBuffer(data))
     }
 
-    // https://www.w3.org/TR/webrtc/#dom-rtcdatachannel-send!overload-3
+    /// <https://www.w3.org/TR/webrtc/#dom-rtcdatachannel-send!overload-3>
     fn Send___(&self, data: CustomAutoRooterGuard<ArrayBufferView>) -> Fallible<()> {
         self.send(&SendSource::ArrayBufferView(data))
     }

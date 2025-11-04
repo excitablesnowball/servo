@@ -62,7 +62,7 @@ use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::headers::is_forbidden_request_header;
 use crate::dom::node::Node;
-use crate::dom::performanceresourcetiming::InitiatorType;
+use crate::dom::performance::performanceresourcetiming::InitiatorType;
 use crate::dom::progressevent::ProgressEvent;
 use crate::dom::readablestream::ReadableStream;
 use crate::dom::servoparser::ServoParser;
@@ -932,10 +932,10 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
                 if ready_state == XMLHttpRequestState::Done ||
                     ready_state == XMLHttpRequestState::Loading
                 {
-                    self.text_response().safe_to_jsval(cx, rval);
+                    self.text_response().safe_to_jsval(cx, rval, can_gc);
                 } else {
                     // Step 1
-                    "".safe_to_jsval(cx, rval);
+                    "".safe_to_jsval(cx, rval, can_gc);
                 }
             },
             // Step 1
@@ -943,14 +943,16 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
                 rval.set(NullValue());
             },
             // Step 2
-            XMLHttpRequestResponseType::Document => {
-                self.document_response(can_gc).safe_to_jsval(cx, rval)
-            },
+            XMLHttpRequestResponseType::Document => self
+                .document_response(can_gc)
+                .safe_to_jsval(cx, rval, can_gc),
             XMLHttpRequestResponseType::Json => self.json_response(cx, rval),
-            XMLHttpRequestResponseType::Blob => self.blob_response(can_gc).safe_to_jsval(cx, rval),
+            XMLHttpRequestResponseType::Blob => {
+                self.blob_response(can_gc).safe_to_jsval(cx, rval, can_gc)
+            },
             XMLHttpRequestResponseType::Arraybuffer => {
                 match self.arraybuffer_response(cx, can_gc) {
-                    Some(array_buffer) => array_buffer.safe_to_jsval(cx, rval),
+                    Some(array_buffer) => array_buffer.safe_to_jsval(cx, rval, can_gc),
                     None => rval.set(NullValue()),
                 }
             },

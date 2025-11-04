@@ -18,7 +18,7 @@ use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::AbortSignalBinding::AbortSignalMethods;
 use crate::dom::bindings::codegen::Bindings::EventListenerBinding::EventListener;
 use crate::dom::bindings::codegen::Bindings::EventTargetBinding::EventListenerOptions;
-use crate::dom::bindings::error::{Error, ErrorToJsval};
+use crate::dom::bindings::error::{Error, ErrorToJsval, Fallible};
 use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::{DomGlobal, reflect_dom_object_with_proto};
 use crate::dom::bindings::root::{Dom, DomRoot};
@@ -27,7 +27,7 @@ use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::readablestream::PipeTo;
 use crate::fetch::{DeferredFetchRecord, FetchContext};
-use crate::realms::InRealm;
+use crate::realms::{InRealm, enter_realm};
 use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
 
 impl js::gc::Rootable for AbortAlgorithm {}
@@ -326,6 +326,62 @@ impl AbortSignalMethods<crate::DomTypeHolder> for AbortSignal {
         signal
     }
 
+    /// <https://dom.spec.whatwg.org/#dom-abortsignal-timeout>
+    fn Timeout(global: &GlobalScope, milliseconds: u64, can_gc: CanGc) -> DomRoot<AbortSignal> {
+        // Step 1. Let signal be a new AbortSignal object.
+        let signal = AbortSignal::new_with_proto(global, None, can_gc);
+
+        // Step 2. Let global be signal’s relevant global object.
+        // We already have `global`.
+
+        let signal_keepalive: Trusted<AbortSignal> = Trusted::new(&signal);
+
+        let ms_i64 = if milliseconds > i64::MAX as u64 {
+            i64::MAX
+        } else {
+            milliseconds as i64
+        };
+
+        // Step 3. Run steps after a timeout given global, "AbortSignal-timeout", milliseconds, and the following step:
+        global.run_steps_after_a_timeout(
+            DOMString::from("AbortSignal-timeout"),
+            ms_i64,
+            move |global, _can_gc| {
+                let task_source = global.task_manager().timer_task_source().to_sendable();
+
+                // Step 3.1. Queue a global task on the timer task source given global to signal abort given signal and a new "TimeoutError" DOMException.
+                // For the duration of this timeout, if signal has any event listeners registered for its abort event,
+                // there must be a strong reference from global to signal.
+                task_source.queue(task!(abortsignal_timeout: move || {
+                    let signal_for_task = signal_keepalive.root();
+
+                    let cx = GlobalScope::get_cx();
+                    rooted!(in(*cx) let mut reason = UndefinedValue());
+                    Error::Timeout.to_jsval(
+                        cx,
+                        &signal_for_task.global(),
+                        reason.handle_mut(),
+                        CanGc::note(),
+                    );
+
+                    let realm = enter_realm(&*signal_for_task.global());
+                    let comp = InRealm::Entered(&realm);
+
+                    // “signal abort given signal and a new "TimeoutError" DOMException.”
+                    signal_for_task.signal_abort(
+                        cx,
+                        reason.handle(),
+                        comp,
+                        CanGc::note(),
+                    );
+                }));
+            },
+        );
+
+        // Step 4. Return signal.
+        signal
+    }
+
     /// <https://dom.spec.whatwg.org/#dom-abortsignal-any>
     fn Any(
         global: &GlobalScope,
@@ -345,7 +401,7 @@ impl AbortSignalMethods<crate::DomTypeHolder> for AbortSignal {
 
     /// <https://dom.spec.whatwg.org/#dom-abortsignal-throwifaborted>
     #[allow(unsafe_code)]
-    fn ThrowIfAborted(&self) {
+    fn ThrowIfAborted(&self) -> Fallible<()> {
         // The throwIfAborted() method steps are to throw this’s abort reason, if this is aborted.
         if self.aborted() {
             let cx = GlobalScope::get_cx();
@@ -356,7 +412,9 @@ impl AbortSignalMethods<crate::DomTypeHolder> for AbortSignal {
                     ExceptionStackBehavior::Capture,
                 )
             };
+            return Err(Error::JSFailed);
         }
+        Ok(())
     }
 
     // <https://dom.spec.whatwg.org/#dom-abortsignal-onabort>

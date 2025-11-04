@@ -10,8 +10,9 @@ use base::id::BrowsingContextId;
 use crossbeam_channel::Select;
 use embedder_traits::{
     InputEvent, KeyboardEvent, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
-    WebDriverCommandMsg, WebDriverScriptCommand, WheelDelta, WheelEvent, WheelMode,
+    WebDriverCommandMsg, WebDriverScriptCommand, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
 };
+use euclid::Point2D;
 use ipc_channel::ipc;
 use keyboard_types::webdriver::KeyInputState;
 use log::info;
@@ -24,7 +25,6 @@ use webdriver::actions::{
 };
 use webdriver::command::ActionsParameters;
 use webdriver::error::{ErrorStatus, WebDriverError};
-use webrender_api::units::DevicePoint;
 
 use crate::{Handler, VerifyBrowsingContextIsOpen, WebElement, wait_for_ipc_response};
 
@@ -87,7 +87,7 @@ impl PointerInputState {
     }
 
     /// <https://w3c.github.io/webdriver/#dfn-get-a-pointer-id>
-    pub(crate) fn get_pointer_id(subtype: PointerType, pointer_ids: FxHashSet<u32>) -> u32 {
+    fn get_pointer_id(subtype: PointerType, pointer_ids: FxHashSet<u32>) -> u32 {
         // Step 2 - 4: Let pointer ids be all the values in input state map which is
         // pointer input source. This is already done and passed by the caller.
         if subtype == PointerType::Mouse {
@@ -352,11 +352,7 @@ impl Handler {
     }
 
     /// <https://w3c.github.io/webdriver/#dfn-dispatch-a-pointerdown-action>
-    pub(crate) fn dispatch_pointerdown_action(
-        &mut self,
-        source_id: &str,
-        action: &PointerDownAction,
-    ) {
+    fn dispatch_pointerdown_action(&mut self, source_id: &str, action: &PointerDownAction) {
         let pointer_input_state = self.get_pointer_input_state_mut(source_id);
         // Step 3. If the source's pressed property contains button return success with data null.
         if pointer_input_state.pressed.contains(&action.button) {
@@ -373,14 +369,14 @@ impl Handler {
         self.send_blocking_input_event_to_embedder(InputEvent::MouseButton(MouseButtonEvent::new(
             MouseButtonAction::Down,
             action.button.into(),
-            DevicePoint::new(x as f32, y as f32),
+            WebViewPoint::Page(Point2D::new(x as f32, y as f32)),
         )));
 
         // Step 17. Return success with data null.
     }
 
     /// <https://w3c.github.io/webdriver/#dfn-dispatch-a-pointerup-action>
-    pub(crate) fn dispatch_pointerup_action(&mut self, source_id: &str, action: &PointerUpAction) {
+    fn dispatch_pointerup_action(&mut self, source_id: &str, action: &PointerUpAction) {
         let pointer_input_state = self.get_pointer_input_state_mut(source_id);
         // Step 3. If the source's pressed property does not contain button, return success with data null.
         if !pointer_input_state.pressed.contains(&action.button) {
@@ -409,14 +405,14 @@ impl Handler {
         self.send_blocking_input_event_to_embedder(InputEvent::MouseButton(MouseButtonEvent::new(
             MouseButtonAction::Up,
             action.button.into(),
-            DevicePoint::new(x as f32, y as f32),
+            WebViewPoint::Page(Point2D::new(x as f32, y as f32)),
         )));
 
         // Step 8. Return success with data null.
     }
 
     /// <https://w3c.github.io/webdriver/#dfn-dispatch-a-pointermove-action>
-    pub(crate) fn dispatch_pointermove_action(
+    fn dispatch_pointermove_action(
         &mut self,
         source_id: &str,
         action: &PointerMoveAction,
@@ -526,9 +522,8 @@ impl Handler {
             if x != current_x || y != current_y || last {
                 // Step 7.1. Let buttons be equal to input state's buttons property.
                 // Step 7.2. Perform implementation-specific action dispatch steps
-                let input_event = InputEvent::MouseMove(MouseMoveEvent::new(DevicePoint::new(
-                    x as f32, y as f32,
-                )));
+                let point = WebViewPoint::Page(Point2D::new(x as f32, y as f32));
+                let input_event = InputEvent::MouseMove(MouseMoveEvent::new(point));
                 if last {
                     self.send_blocking_input_event_to_embedder(input_event);
                 } else {
@@ -694,7 +689,7 @@ impl Handler {
                     z: 0.0,
                     mode: WheelMode::DeltaPixel,
                 };
-                let point = DevicePoint::new(x as f32, y as f32);
+                let point = WebViewPoint::Page(Point2D::new(x as f32, y as f32));
                 let input_event = InputEvent::Wheel(WheelEvent::new(delta, point));
                 if last {
                     self.send_blocking_input_event_to_embedder(input_event);
@@ -842,7 +837,7 @@ impl Handler {
     }
 
     /// <https://w3c.github.io/webdriver/#dfn-process-an-input-source-action-sequence>
-    pub(crate) fn process_an_input_source_action_sequence(
+    fn process_an_input_source_action_sequence(
         &mut self,
         action_sequence: ActionSequence,
     ) -> Vec<ActionItem> {

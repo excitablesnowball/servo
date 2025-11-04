@@ -73,8 +73,8 @@ use crate::dom::html::htmlinputelement::HTMLInputElement;
 use crate::dom::html::htmlscriptelement::{HTMLScriptElement, ScriptResult};
 use crate::dom::html::htmltemplateelement::HTMLTemplateElement;
 use crate::dom::node::{Node, ShadowIncluding};
-use crate::dom::performanceentry::PerformanceEntry;
-use crate::dom::performancenavigationtiming::PerformanceNavigationTiming;
+use crate::dom::performance::performanceentry::PerformanceEntry;
+use crate::dom::performance::performancenavigationtiming::PerformanceNavigationTiming;
 use crate::dom::processinginstruction::ProcessingInstruction;
 use crate::dom::processingoptions::{
     LinkHeader, LinkProcessingPhase, extract_links_from_headers, process_link_headers,
@@ -700,7 +700,6 @@ impl ServoParser {
             if is_execution_stack_empty() {
                 self.document
                     .window()
-                    .as_global_scope()
                     .perform_a_microtask_checkpoint(can_gc);
             }
 
@@ -723,7 +722,7 @@ impl ServoParser {
         }
     }
 
-    // https://html.spec.whatwg.org/multipage/#the-end
+    /// <https://html.spec.whatwg.org/multipage/#the-end>
     fn finish(&self, can_gc: CanGc) {
         assert!(!self.suspended.get());
         assert!(self.last_chunk_received.get());
@@ -1767,10 +1766,7 @@ fn create_element_for_token(
         document.increment_throw_on_dynamic_markup_insertion_counter();
         // Step 6.2
         if is_execution_stack_empty() {
-            document
-                .window()
-                .as_global_scope()
-                .perform_a_microtask_checkpoint(can_gc);
+            document.window().perform_a_microtask_checkpoint(can_gc);
         }
         // Step 6.3
         custom_element_reaction_stack.push_new_element_queue()

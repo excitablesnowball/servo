@@ -13,18 +13,13 @@ use std::{env, fs};
 
 use ::servo::ServoBuilder;
 use crossbeam_channel::unbounded;
-use euclid::Vector2D;
 use log::{info, trace, warn};
 use net::protocols::ProtocolRegistry;
 use servo::config::opts::Opts;
 use servo::config::prefs::Preferences;
 use servo::servo_url::ServoUrl;
 use servo::user_content_manager::{UserContentManager, UserScript};
-use servo::webrender_api::ScrollLocation;
-use servo::{
-    EventLoopWaker, InputEvent, ScreenshotCaptureError, WebDriverCommandMsg,
-    WebDriverScriptCommand, WebDriverUserPromptAction, WheelEvent,
-};
+use servo::{EventLoopWaker, WebDriverCommandMsg, WebDriverUserPromptAction};
 use url::Url;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -41,6 +36,7 @@ use crate::desktop::tracing::trace_winit_event;
 use crate::desktop::window_trait::WindowPortsMethods;
 use crate::parser::{get_default_url, location_bar_input_to_url};
 use crate::prefs::ServoShellPreferences;
+use crate::running_app_state::RunningAppStateTrait;
 
 pub struct App {
     opts: Opts,
@@ -214,7 +210,9 @@ impl App {
                 need_window_redraw,
             } => {
                 let updated = match (update, &mut self.minibrowser) {
-                    (true, Some(minibrowser)) => minibrowser.update_webview_data(state),
+                    (true, Some(minibrowser)) => {
+                        minibrowser.update_webview_data(state, window.clone())
+                    },
                     _ => false,
                 };
 
@@ -320,7 +318,7 @@ impl App {
         }
     }
 
-    pub fn handle_webdriver_messages(&self) {
+    pub(crate) fn handle_webdriver_messages(&self) {
         let AppState::Running(running_state) = &self.state else {
             return;
         };
@@ -471,33 +469,14 @@ impl App {
                     }
                 },
                 WebDriverCommandMsg::InputEvent(webview_id, input_event, response_sender) => {
-                    if let Some(webview) = running_state.webview_by_id(webview_id) {
-                        // TODO: Scroll events triggered by wheel events should happen as
-                        // a default event action in the compositor.
-                        let scroll_event = match &input_event {
-                            InputEvent::Wheel(WheelEvent { delta, point }) => {
-                                let scroll_location = ScrollLocation::Delta(Vector2D::new(
-                                    -delta.x as f32,
-                                    -delta.y as f32,
-                                ));
-                                Some((scroll_location, point.to_i32()))
-                            },
-                            _ => None,
-                        };
-
-                        running_state.handle_webdriver_input_event(
-                            webview_id,
-                            input_event,
-                            response_sender,
-                        );
-
-                        if let Some((scroll_location, scroll_point)) = scroll_event {
-                            webview.notify_scroll_event(scroll_location, scroll_point);
-                        }
-                    }
+                    running_state.handle_webdriver_input_event(
+                        webview_id,
+                        input_event,
+                        response_sender,
+                    );
                 },
                 WebDriverCommandMsg::ScriptCommand(_, ref webdriver_script_command) => {
-                    self.handle_webdriver_script_command(webdriver_script_command, running_state);
+                    running_state.handle_webdriver_script_command(webdriver_script_command);
                     running_state.servo().execute_webdriver_command(msg);
                 },
                 WebDriverCommandMsg::CurrentUserPrompt(webview_id, response_sender) => {
@@ -547,48 +526,9 @@ impl App {
                     running_state.set_alert_text_of_newest_dialog(webview_id, text);
                 },
                 WebDriverCommandMsg::TakeScreenshot(webview_id, rect, result_sender) => {
-                    let Some(webview) = running_state.webview_by_id(webview_id) else {
-                        if let Err(error) =
-                            result_sender.send(Err(ScreenshotCaptureError::WebViewDoesNotExist))
-                        {
-                            warn!("Failed to send response to TakeScreenshot: {error}");
-                        }
-                        continue;
-                    };
-                    let rect =
-                        rect.map(|rect| rect.to_box2d() * webview.device_pixels_per_css_pixel());
-                    webview.take_screenshot(rect, move |result| {
-                        if let Err(error) = result_sender.send(result) {
-                            warn!("Failed to send response to TakeScreenshot: {error}");
-                        }
-                    });
+                    running_state.handle_webdriver_screenshot(webview_id, rect, result_sender);
                 },
             };
-        }
-    }
-
-    fn handle_webdriver_script_command(
-        &self,
-        msg: &WebDriverScriptCommand,
-        running_state: &RunningAppState,
-    ) {
-        match msg {
-            WebDriverScriptCommand::ExecuteScript(_webview_id, response_sender) |
-            WebDriverScriptCommand::ExecuteAsyncScript(_webview_id, response_sender) => {
-                // Give embedder a chance to interrupt the script command.
-                // Webdriver only handles 1 script command at a time, so we can
-                // safely set a new interrupt sender and remove the previous one here.
-                running_state.set_script_command_interrupt_sender(Some(response_sender.clone()));
-            },
-            WebDriverScriptCommand::AddLoadStatusSender(webview_id, load_status_sender) => {
-                running_state.set_load_status_sender(*webview_id, load_status_sender.clone());
-            },
-            WebDriverScriptCommand::RemoveLoadStatusSender(webview_id) => {
-                running_state.remove_load_status_sender(*webview_id);
-            },
-            _ => {
-                running_state.set_script_command_interrupt_sender(None);
-            },
         }
     }
 }

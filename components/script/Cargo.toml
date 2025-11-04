@@ -43,6 +43,7 @@ background_hang_monitor_api = { workspace = true }
 backtrace = { workspace = true }
 base = { workspace = true }
 base64 = { workspace = true }
+base64ct = { workspace = true }
 bincode = { workspace = true }
 bitflags = { workspace = true }
 bluetooth_traits = { workspace = true, optional = true }
@@ -62,9 +63,11 @@ deny_public_fields = { path = "../deny_public_fields" }
 devtools_traits = { workspace = true }
 dom_struct = { path = "../dom_struct" }
 domobject_derive = { path = "../domobject_derive" }
+elliptic-curve = { workspace = true }
 embedder_traits = { workspace = true }
 encoding_rs = { workspace = true }
 euclid = { workspace = true }
+flate2 = { workspace = true }
 fonts = { path = "../fonts" }
 fonts_traits = { workspace = true }
 glow = { workspace = true }
@@ -95,10 +98,14 @@ nom = { workspace = true }
 nom-rfc8288 = { workspace = true }
 num-traits = { workspace = true }
 num_cpus = { workspace = true }
+p256 = { workspace = true }
+p384 = { workspace = true }
+p521 = { workspace = true }
 parking_lot = { workspace = true }
 percent-encoding = { workspace = true }
 phf = "0.11"
 pixels = { path = "../pixels" }
+pkcs8 = { workspace = true }
 profile_traits = { workspace = true }
 rand = { workspace = true }
 range = { path = "../range" }
@@ -106,6 +113,7 @@ regex = { workspace = true }
 rustc-hash = { workspace = true }
 script_bindings = { path = "../script_bindings" }
 script_traits = { workspace = true }
+sec1 = { workspace = true }
 selectors = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

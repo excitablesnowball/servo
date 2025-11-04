@@ -215,8 +215,8 @@ jobs:
           # The main reason however, is that we can use the application traces to determine if servo
           # successfully reaches certain locations in the code, in particular if a page is successfully loaded.
           hdc shell hitrace -b "${TRACE_BUFFER_SZ_KB}" app graphic ohos freq idle memory --trace_begin
-          # We start servo, tell it to load a website (servo.org). JIT is not allowed on HarmonyOS 5.
-          hdc shell aa start -a EntryAbility -b org.servo.servo -U https://servo.org --ps=--pref js_disable_jit=true
+          # We start servo, tell it to load a website (servo.org).
+          hdc shell aa start -a EntryAbility -b org.servo.servo -U https://servo.org
           servo_pid=$(hdc shell pidof org.servo.servo)
           # We don't really know how long servo needs to load a webpage, so we just wait 10s.
           sleep 10
@@ -291,9 +291,20 @@ jobs:
         id: BencherRun
         run: ./mach test-speedometer-ohos --bmf-output speedometer.json --profile ${{ inputs.profile }}
         continue-on-error: true
-      - name: Create empty speedometer.json if failed
-        run: touch speedometer.json
+      - name: Handle failed speedometer
         if: ${{ steps.BencherRun.outcome == 'failure' }}
+        run: | 
+          touch speedometer.json # Create an empty file for bencher.
+          mkdir speedometer_error_logs
+          hdc shell snapshot_display -f /data/local/tmp/servo.jpeg
+          hdc file recv /data/local/tmp/servo.jpeg speedometer_error_logs/servo_hos_screenshot.jpeg
+          # Todo: Upload logs. This is currently not possible since the test-speedometer-ohos command
+          # sets a log filter, which filters everything except JS console output.
+      - uses: actions/upload-artifact@v4
+        if: ${{ steps.BencherRun.outcome == 'failure' }}
+        with:
+          name: ohos-speedometer-failure-${{ matrix.target }}-${{ inputs.profile }}
+          path: speedometer_error_logs
       - name: Getting model name
         # awk is used to remove trailing spaces
         run: |

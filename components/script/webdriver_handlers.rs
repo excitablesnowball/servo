@@ -1257,7 +1257,7 @@ fn handle_send_keys_non_typeable(
 
     // Step 4. If element is suffering from bad input, return ErrorStatus::InvalidArgument.
     if input_element
-        .Validity()
+        .Validity(can_gc)
         .invalid_flags()
         .contains(ValidationFlags::BAD_INPUT)
     {
@@ -1506,7 +1506,7 @@ pub(crate) fn handle_add_cookie(
     reply
         .send(match (document.is_cookie_averse(), domain) {
             (true, _) => Err(ErrorStatus::InvalidCookieDomain),
-            (false, Some(ref domain)) if url.host_str().map(|x| x == domain).unwrap_or(false) => {
+            (false, Some(ref domain)) if url.host_str().is_some_and(|host| host == domain) => {
                 let _ = document
                     .window()
                     .as_global_scope()

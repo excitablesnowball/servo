@@ -77,7 +77,7 @@ pub(crate) fn throw_dom_exception(
         Ok(exception) => unsafe {
             assert!(!JS_IsExceptionPending(*cx));
             rooted!(in(*cx) let mut thrown = UndefinedValue());
-            exception.safe_to_jsval(cx, thrown.handle_mut());
+            exception.safe_to_jsval(cx, thrown.handle_mut(), can_gc);
             JS_SetPendingException(*cx, thrown.handle(), ExceptionStackBehavior::Capture);
         },
 
@@ -122,7 +122,10 @@ pub(crate) fn create_dom_exception(
             return new_custom_exception(DOMErrorName::WrongDocumentError, doc_err_custom_message);
         },
         Error::WrongDocument(None) => DOMErrorName::WrongDocumentError,
-        Error::InvalidCharacter => DOMErrorName::InvalidCharacterError,
+        Error::InvalidCharacter(Some(custom_message)) => {
+            return new_custom_exception(DOMErrorName::InvalidCharacterError, custom_message);
+        },
+        Error::InvalidCharacter(None) => DOMErrorName::InvalidCharacterError,
         Error::NotSupported => DOMErrorName::NotSupportedError,
         Error::InUseAttribute => DOMErrorName::InUseAttributeError,
         Error::InvalidState(Some(custom_message)) => {

@@ -39,7 +39,7 @@ use crate::dom::element::{AttributeMutation, Element, LayoutElementHelpers};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::html::htmlmediaelement::{HTMLMediaElement, NetworkState, ReadyState};
 use crate::dom::node::{Node, NodeTraits};
-use crate::dom::performanceresourcetiming::InitiatorType;
+use crate::dom::performance::performanceresourcetiming::InitiatorType;
 use crate::dom::virtualmethods::VirtualMethods;
 use crate::fetch::FetchCanceller;
 use crate::network_listener::{self, PreInvoke, ResourceTimingListener};
@@ -338,7 +338,7 @@ impl HTMLVideoElementMethods<crate::DomTypeHolder> for HTMLVideoElement {
     // <https://html.spec.whatwg.org/multipage/#dom-video-height>
     make_dimension_uint_setter!(SetHeight, "height");
 
-    // https://html.spec.whatwg.org/multipage/#dom-video-videowidth
+    /// <https://html.spec.whatwg.org/multipage/#dom-video-videowidth>
     fn VideoWidth(&self) -> u32 {
         if self.htmlmediaelement.get_ready_state() == ReadyState::HaveNothing {
             return 0;
@@ -346,7 +346,7 @@ impl HTMLVideoElementMethods<crate::DomTypeHolder> for HTMLVideoElement {
         self.video_width.get().unwrap_or(0)
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-video-videoheight
+    /// <https://html.spec.whatwg.org/multipage/#dom-video-videoheight>
     fn VideoHeight(&self) -> u32 {
         if self.htmlmediaelement.get_ready_state() == ReadyState::HaveNothing {
             return 0;

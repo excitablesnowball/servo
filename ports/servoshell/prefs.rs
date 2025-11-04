@@ -25,19 +25,16 @@ use url::Url;
 use crate::VERSION;
 
 pub(crate) static EXPERIMENTAL_PREFS: &[&str] = &[
-    "dom_abort_controller_enabled",
     "dom_async_clipboard_enabled",
     "dom_fontface_enabled",
     "dom_intersection_observer_enabled",
-    "dom_mouse_event_which_enabled",
+    "dom_uievent_which_enabled",
     "dom_navigator_sendbeacon_enabled",
     "dom_notification_enabled",
     "dom_offscreen_canvas_enabled",
     "dom_permissions_enabled",
-    "dom_resize_observer_enabled",
     "dom_webgl2_enabled",
     "dom_webgpu_enabled",
-    "dom_xpath_enabled",
     "layout_columns_enabled",
     "layout_container_queries_enabled",
     "layout_grid_enabled",
@@ -701,7 +698,7 @@ pub(crate) fn parse_command_line_arguments(args: Vec<String>) -> ArgumentParsing
     for debug_string in cmd_args.debug {
         let result = debug_options.extend(debug_string);
         if let Err(error) = result {
-            println!("error: urnecognized debug option: {}", error);
+            println!("error: unrecognized debug option: {}", error);
             return ArgumentParsingResult::ErrorParsing;
         }
     }
@@ -721,7 +718,7 @@ pub(crate) fn parse_command_line_arguments(args: Vec<String>) -> ArgumentParsing
         random_pipeline_closure_probability: cmd_args.random_pipeline_closure_probability,
         random_pipeline_closure_seed: cmd_args.random_pipeline_closure_seed,
         config_dir: config_dir.clone(),
-        shaders_dir: cmd_args.shaders,
+        shaders_path: cmd_args.shaders,
         certificate_path: cmd_args
             .certificate_path
             .map(|p| p.to_string_lossy().into_owned()),

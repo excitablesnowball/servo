@@ -7,11 +7,12 @@ use std::ptr::NonNull;
 
 use dom_struct::dom_struct;
 use js::jsapi::{Heap, JSObject, Value};
+use malloc_size_of::MallocSizeOf;
 use script_bindings::conversions::SafeToJSValConvertible;
 
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::CryptoKeyBinding::{
-    CryptoKeyMethods, KeyType, KeyUsage,
+    CryptoKeyMethods, CryptoKeyPair, KeyType, KeyUsage,
 };
 use crate::dom::bindings::reflector::{Reflector, reflect_dom_object};
 use crate::dom::bindings::root::DomRoot;
@@ -21,19 +22,25 @@ use crate::script_runtime::{CanGc, JSContext};
 
 pub(crate) enum CryptoKeyOrCryptoKeyPair {
     CryptoKey(DomRoot<CryptoKey>),
-    // TODO: CryptoKeyPair(CryptoKeyPair),
+    CryptoKeyPair(CryptoKeyPair),
 }
 
 /// The underlying cryptographic data this key represents
 #[allow(dead_code)]
-#[derive(MallocSizeOf)]
 pub(crate) enum Handle {
+    P256PrivateKey(p256::SecretKey),
+    P384PrivateKey(p384::SecretKey),
+    P521PrivateKey(p521::SecretKey),
+    P256PublicKey(p256::PublicKey),
+    P384PublicKey(p384::PublicKey),
+    P521PublicKey(p521::PublicKey),
     Aes128(Vec<u8>),
     Aes192(Vec<u8>),
     Aes256(Vec<u8>),
     Pbkdf2(Vec<u8>),
     Hkdf(Vec<u8>),
     Hmac(Vec<u8>),
+    Ed25519(Vec<u8>),
 }
 
 /// <https://w3c.github.io/webcrypto/#cryptokey-interface>
@@ -118,14 +125,14 @@ impl CryptoKey {
 
         // Create and store a cached object of algorithm
         rooted!(in(*cx) let mut algorithm_object_value: Value);
-        algorithm.safe_to_jsval(cx, algorithm_object_value.handle_mut());
+        algorithm.safe_to_jsval(cx, algorithm_object_value.handle_mut(), can_gc);
         crypto_key
             .algorithm_cached
             .set(algorithm_object_value.to_object());
 
         // Create and store a cached object of usages
         rooted!(in(*cx) let mut usages_object_value: Value);
-        usages.safe_to_jsval(cx, usages_object_value.handle_mut());
+        usages.safe_to_jsval(cx, usages_object_value.handle_mut(), can_gc);
         crypto_key
             .usages_cached
             .set(usages_object_value.to_object());
@@ -155,7 +162,7 @@ impl CryptoKey {
         // Create and store a cached object of usages
         let cx = GlobalScope::get_cx();
         rooted!(in(*cx) let mut usages_object_value: Value);
-        usages.safe_to_jsval(cx, usages_object_value.handle_mut());
+        usages.safe_to_jsval(cx, usages_object_value.handle_mut(), CanGc::note());
         self.usages_cached.set(usages_object_value.to_object());
     }
 }
@@ -197,6 +204,28 @@ impl Handle {
             Self::Pbkdf2(bytes) => bytes,
             Self::Hkdf(bytes) => bytes,
             Self::Hmac(bytes) => bytes,
+            Self::Ed25519(bytes) => bytes,
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl MallocSizeOf for Handle {
+    fn size_of(&self, ops: &mut malloc_size_of::MallocSizeOfOps) -> usize {
+        match self {
+            Handle::P256PrivateKey(secret_key) => secret_key.size_of(ops),
+            Handle::P384PrivateKey(secret_key) => secret_key.size_of(ops),
+            Handle::P521PrivateKey(secret_key) => secret_key.size_of(ops),
+            Handle::P256PublicKey(public_key) => public_key.size_of(ops),
+            Handle::P384PublicKey(public_key) => public_key.size_of(ops),
+            Handle::P521PublicKey(public_key) => public_key.size_of(ops),
+            Handle::Aes128(bytes) => bytes.size_of(ops),
+            Handle::Aes192(bytes) => bytes.size_of(ops),
+            Handle::Aes256(bytes) => bytes.size_of(ops),
+            Handle::Pbkdf2(bytes) => bytes.size_of(ops),
+            Handle::Hkdf(bytes) => bytes.size_of(ops),
+            Handle::Hmac(bytes) => bytes.size_of(ops),
+            Handle::Ed25519(bytes) => bytes.size_of(ops),
         }
     }
 }

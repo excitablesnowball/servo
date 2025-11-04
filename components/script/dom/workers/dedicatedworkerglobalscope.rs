@@ -23,7 +23,6 @@ use net_traits::request::{
     CredentialsMode, Destination, InsecureRequestsPolicy, ParserMetadata, Referrer, RequestBuilder,
     RequestMode,
 };
-use rand::random;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use style::thread_state::{self, ThreadState};
 
@@ -183,9 +182,7 @@ pub(crate) struct DedicatedWorkerGlobalScope {
     #[ignore_malloc_size_of = "Defined in std"]
     task_queue: TaskQueue<DedicatedWorkerScriptMsg>,
     own_sender: Sender<DedicatedWorkerScriptMsg>,
-    #[ignore_malloc_size_of = "Trusted<T> has unclear ownership like Dom<T>"]
     worker: DomRefCell<Option<TrustedWorkerAddress>>,
-    #[ignore_malloc_size_of = "Can't measure trait objects"]
     /// Sender to the parent thread.
     parent_event_loop_sender: ScriptEventLoopSender,
     #[ignore_malloc_size_of = "ImageCache"]
@@ -399,12 +396,14 @@ impl DedicatedWorkerGlobalScope {
                     .policy_container(policy_container.clone())
                     .origin(origin);
 
+                let event_loop_sender = ScriptEventLoopSender::DedicatedWorker {
+                    sender: own_sender.clone(),
+                    main_thread_worker: worker.clone(),
+                };
+
                 let runtime = unsafe {
                     let task_source = SendableTaskSource {
-                        sender: ScriptEventLoopSender::DedicatedWorker {
-                            sender: own_sender.clone(),
-                            main_thread_worker: worker.clone(),
-                        },
+                        sender: event_loop_sender.clone(),
                         pipeline_id,
                         name: TaskSourceName::Networking,
                         canceller: Default::default(),
@@ -462,8 +461,8 @@ impl DedicatedWorkerGlobalScope {
                     worker_url,
                     devtools_mpsc_port,
                     runtime,
-                    parent_event_loop_sender.clone(),
-                    own_sender.clone(),
+                    parent_event_loop_sender,
+                    own_sender,
                     receiver,
                     closing,
                     image_cache,
@@ -480,8 +479,6 @@ impl DedicatedWorkerGlobalScope {
                     pipeline_id,
                     Some(worker_id),
                 );
-                // FIXME(njn): workers currently don't have a unique ID suitable for using in reporter
-                // registration (#6631), so we instead use a random number and cross our fingers.
                 let scope = global.upcast::<WorkerGlobalScope>();
                 let global_scope = global.upcast::<GlobalScope>();
 
@@ -489,10 +486,7 @@ impl DedicatedWorkerGlobalScope {
                 let request = request.https_state(global_scope.get_https_state());
 
                 let task_source = SendableTaskSource {
-                    sender: ScriptEventLoopSender::DedicatedWorker {
-                        sender: own_sender,
-                        main_thread_worker: worker.clone(),
-                    },
+                    sender: event_loop_sender.clone(),
                     pipeline_id,
                     name: TaskSourceName::Networking,
                     canceller: Default::default(),
@@ -505,7 +499,7 @@ impl DedicatedWorkerGlobalScope {
                 )));
                 global_scope.fetch(request, context, task_source);
 
-                let reporter_name = format!("dedicated-worker-reporter-{}", random::<u64>());
+                let reporter_name = format!("dedicated-worker-reporter-{}", worker_id);
                 scope
                     .upcast::<GlobalScope>()
                     .mem_profiler_chan()
@@ -521,7 +515,7 @@ impl DedicatedWorkerGlobalScope {
                             }
                         },
                         reporter_name,
-                        parent_event_loop_sender,
+                        event_loop_sender,
                         CommonScriptMsg::CollectReports,
                     );
                 scope.clear_js_runtime();
@@ -589,7 +583,9 @@ impl DedicatedWorkerGlobalScope {
         let target = self.upcast();
         let _ac = enter_realm(self);
         rooted!(in(*scope.get_cx()) let mut message = UndefinedValue());
-        if let Ok(ports) = structuredclone::read(scope.upcast(), *msg.data, message.handle_mut()) {
+        if let Ok(ports) =
+            structuredclone::read(scope.upcast(), *msg.data, message.handle_mut(), can_gc)
+        {
             MessageEvent::dispatch_jsval(
                 target,
                 scope.upcast(),
@@ -685,7 +681,7 @@ impl DedicatedWorkerGlobalScope {
             .unwrap();
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-dedicatedworkerglobalscope-postmessage
+    /// <https://html.spec.whatwg.org/multipage/#dom-dedicatedworkerglobalscope-postmessage>
     fn post_message_impl(
         &self,
         cx: SafeJSContext,
@@ -750,6 +746,11 @@ pub(crate) unsafe extern "C" fn interrupt_callback(cx: *mut JSContext) -> bool {
 }
 
 impl DedicatedWorkerGlobalScopeMethods<crate::DomTypeHolder> for DedicatedWorkerGlobalScope {
+    /// <https://html.spec.whatwg.org/multipage/#dom-dedicatedworkerglobalscope-name>
+    fn Name(&self) -> DOMString {
+        self.workerglobalscope.worker_name()
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#dom-dedicatedworkerglobalscope-postmessage>
     fn PostMessage(
         &self,
@@ -778,7 +779,7 @@ impl DedicatedWorkerGlobalScopeMethods<crate::DomTypeHolder> for DedicatedWorker
         self.post_message_impl(cx, message, guard)
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-dedicatedworkerglobalscope-close
+    /// <https://html.spec.whatwg.org/multipage/#dom-dedicatedworkerglobalscope-close>
     fn Close(&self) {
         // Step 2
         self.upcast::<WorkerGlobalScope>().close();
@@ -786,4 +787,7 @@ impl DedicatedWorkerGlobalScopeMethods<crate::DomTypeHolder> for DedicatedWorker
 
     // https://html.spec.whatwg.org/multipage/#handler-dedicatedworkerglobalscope-onmessage
     event_handler!(message, GetOnmessage, SetOnmessage);
+
+    // https://html.spec.whatwg.org/multipage/#handler-dedicatedworkerglobalscope-onmessageerror
+    event_handler!(messageerror, GetOnmessageerror, SetOnmessageerror);
 }

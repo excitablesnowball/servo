@@ -24,6 +24,7 @@ use constellation_traits::{
     PortMessageTask, ScriptToConstellationChan, ScriptToConstellationMessage,
 };
 use content_security_policy::CspList;
+use content_security_policy::sandboxing_directive::SandboxingFlagSet;
 use crossbeam_channel::Sender;
 use devtools_traits::{PageError, ScriptToDevtoolsControlMsg};
 use dom_struct::dom_struct;
@@ -49,8 +50,10 @@ use net_traits::filemanager_thread::{
     FileManagerResult, FileManagerThreadMsg, ReadFileProgress, RelativePos,
 };
 use net_traits::image_cache::ImageCache;
-use net_traits::policy_container::PolicyContainer;
-use net_traits::request::{InsecureRequestsPolicy, Referrer, RequestBuilder};
+use net_traits::policy_container::{PolicyContainer, RequestPolicyContainer};
+use net_traits::request::{
+    InsecureRequestsPolicy, Origin as RequestOrigin, Referrer, RequestBuilder, RequestClient,
+};
 use net_traits::response::HttpsState;
 use net_traits::{
     CoreResourceMsg, CoreResourceThread, FetchResponseListener, ReferrerPolicy, ResourceThreads,
@@ -82,7 +85,6 @@ use crate::dom::bindings::codegen::Bindings::PermissionStatusBinding::{
     PermissionName, PermissionState,
 };
 use crate::dom::bindings::codegen::Bindings::ReportingObserverBinding::Report;
-use crate::dom::bindings::codegen::Bindings::VoidFunctionBinding::VoidFunction;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use crate::dom::bindings::codegen::Bindings::WorkerGlobalScopeBinding::WorkerGlobalScopeMethods;
 use crate::dom::bindings::conversions::{root_from_object, root_from_object_static};
@@ -111,10 +113,11 @@ use crate::dom::eventsource::EventSource;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::file::File;
 use crate::dom::html::htmlscriptelement::{ScriptId, SourceCode};
+use crate::dom::htmlscriptelement::ScriptOrigin;
 use crate::dom::messageport::MessagePort;
 use crate::dom::paintworkletglobalscope::PaintWorkletGlobalScope;
-use crate::dom::performance::Performance;
-use crate::dom::performanceobserver::VALID_ENTRY_TYPES;
+use crate::dom::performance::performance::Performance;
+use crate::dom::performance::performanceobserver::VALID_ENTRY_TYPES;
 use crate::dom::promise::Promise;
 use crate::dom::readablestream::{CrossRealmTransformReadable, ReadableStream};
 use crate::dom::reportingobserver::ReportingObserver;
@@ -132,7 +135,7 @@ use crate::dom::workerglobalscope::WorkerGlobalScope;
 use crate::dom::workletglobalscope::WorkletGlobalScope;
 use crate::dom::writablestream::CrossRealmTransformWritable;
 use crate::messaging::{CommonScriptMsg, ScriptEventLoopReceiver, ScriptEventLoopSender};
-use crate::microtask::{Microtask, MicrotaskQueue, UserMicrotask};
+use crate::microtask::Microtask;
 use crate::network_listener::{NetworkListener, PreInvoke};
 use crate::realms::{InRealm, enter_realm};
 use crate::script_module::{
@@ -302,15 +305,6 @@ pub(crate) struct GlobalScope {
 
     /// A map for storing the previous permission state read results.
     permission_state_invocation_results: DomRefCell<HashMap<PermissionName, PermissionState>>,
-
-    /// The microtask queue associated with this global.
-    ///
-    /// It is refcounted because windows in the same script thread share the
-    /// same microtask queue.
-    ///
-    /// <https://html.spec.whatwg.org/multipage/#microtask-queue>
-    #[conditional_malloc_size_of]
-    microtask_queue: Rc<MicrotaskQueue>,
 
     /// Vector storing closing references of all workers
     list_auto_close_worker: DomRefCell<Vec<AutoCloseWorker>>,
@@ -768,7 +762,6 @@ impl GlobalScope {
         origin: MutableOrigin,
         creation_url: ServoUrl,
         top_level_creation_url: Option<ServoUrl>,
-        microtask_queue: Rc<MicrotaskQueue>,
         #[cfg(feature = "webgpu")] gpu_id_hub: Arc<IdentityHub>,
         inherited_secure_context: Option<bool>,
         unminify_js: bool,
@@ -802,7 +795,6 @@ impl GlobalScope {
             creation_url,
             top_level_creation_url,
             permission_state_invocation_results: Default::default(),
-            microtask_queue,
             list_auto_close_worker: Default::default(),
             event_source_tracker: DOMTracker::new(),
             uncaught_rejections: Default::default(),
@@ -1355,7 +1347,7 @@ impl GlobalScope {
                                 rooted!(in(*GlobalScope::get_cx()) let mut message = UndefinedValue());
 
                                 // Step 10.3 StructuredDeserialize(serialized, targetRealm).
-                                if let Ok(ports) = structuredclone::read(&global, data, message.handle_mut()) {
+                                if let Ok(ports) = structuredclone::read(&global, data, message.handle_mut(), CanGc::note()) {
                                     // Step 10.4, Fire an event named message at destination.
                                     MessageEvent::dispatch_jsval(
                                         destination.upcast(),
@@ -1494,7 +1486,8 @@ impl GlobalScope {
             // consisting of all MessagePort objects in deserializeRecord.[[TransferredValues]],
             // if any, maintaining their relative order.
             // Note: both done in `structuredclone::read`.
-            if let Ok(ports) = structuredclone::read(self, data, message_clone.handle_mut()) {
+            if let Ok(ports) = structuredclone::read(self, data, message_clone.handle_mut(), can_gc)
+            {
                 // Note: if this port is used to transfer a stream, we handle the events in Rust.
                 if let Some(transform) = cross_realm_transform.as_ref() {
                     match transform {
@@ -2557,6 +2550,21 @@ impl GlobalScope {
         }
     }
 
+    /// Part of <https://fetch.spec.whatwg.org/#populate-request-from-client>
+    pub(crate) fn request_client(&self) -> RequestClient {
+        // Step 1.2.2. If global is a Window object and global’s navigable is not null,
+        // then set request’s traversable for user prompts to global’s navigable’s traversable navigable.
+        let preloaded_resources = self
+            .downcast::<Window>()
+            .map(|window: &Window| window.Document().preloaded_resources())
+            .unwrap_or_default();
+        RequestClient {
+            preloaded_resources,
+            policy_container: RequestPolicyContainer::PolicyContainer(self.policy_container()),
+            origin: RequestOrigin::Origin(self.origin().immutable().clone()),
+        }
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#concept-settings-object-policy-container>
     pub(crate) fn policy_container(&self) -> PolicyContainer {
         if let Some(window) = self.downcast::<Window>() {
@@ -2969,13 +2977,6 @@ impl GlobalScope {
         self.timers().clear_timeout_or_interval(self, handle);
     }
 
-    pub(crate) fn queue_function_as_microtask(&self, callback: Rc<VoidFunction>) {
-        self.enqueue_microtask(Microtask::User(UserMicrotask {
-            callback,
-            pipeline: self.pipeline_id(),
-        }))
-    }
-
     pub(crate) fn fire_timer(&self, handle: TimerEventId, can_gc: CanGc) {
         self.timers().fire_timer(handle, self, can_gc);
     }
@@ -3022,20 +3023,20 @@ impl GlobalScope {
 
     /// Perform a microtask checkpoint.
     pub(crate) fn perform_a_microtask_checkpoint(&self, can_gc: CanGc) {
-        // Only perform the checkpoint if we're not shutting down.
-        if self.can_continue_running() {
-            self.microtask_queue.checkpoint(
-                GlobalScope::get_cx(),
-                |_| Some(DomRoot::from_ref(self)),
-                vec![DomRoot::from_ref(self)],
-                can_gc,
-            );
+        if let Some(window) = self.downcast::<Window>() {
+            window.perform_a_microtask_checkpoint(can_gc);
+        } else if let Some(worker) = self.downcast::<WorkerGlobalScope>() {
+            worker.perform_a_microtask_checkpoint(can_gc);
         }
     }
 
     /// Enqueue a microtask for subsequent execution.
     pub(crate) fn enqueue_microtask(&self, job: Microtask) {
-        self.microtask_queue.enqueue(job, GlobalScope::get_cx());
+        if self.is::<Window>() {
+            ScriptThread::enqueue_microtask(job);
+        } else if let Some(worker) = self.downcast::<WorkerGlobalScope>() {
+            worker.enqueue_microtask(job);
+        }
     }
 
     /// Create a new sender/receiver pair that can be used to implement an on-demand
@@ -3049,11 +3050,6 @@ impl GlobalScope {
             return worker.new_script_pair();
         }
         unreachable!();
-    }
-
-    /// Returns the microtask queue of this global.
-    pub(crate) fn microtask_queue(&self) -> &Rc<MicrotaskQueue> {
-        &self.microtask_queue
     }
 
     /// Process a single event as if it were the next event
@@ -3305,6 +3301,7 @@ impl GlobalScope {
         value: HandleValue,
         options: RootedTraceableBox<StructuredSerializeOptions>,
         retval: MutableHandleValue,
+        can_gc: CanGc,
     ) -> Fallible<()> {
         let mut rooted = CustomAutoRooter::new(
             options
@@ -3317,7 +3314,7 @@ impl GlobalScope {
 
         let data = structuredclone::write(cx, value, Some(guard))?;
 
-        structuredclone::read(self, data, retval)?;
+        structuredclone::read(self, data, retval, can_gc)?;
 
         Ok(())
     }
@@ -3348,6 +3345,10 @@ impl GlobalScope {
             None,
             network_listener.into_callback(),
         );
+    }
+
+    pub(crate) fn unminify_js(&self) -> bool {
+        self.unminified_js_dir.is_some()
     }
 
     pub(crate) fn unminified_js_dir(&self) -> Option<String> {
@@ -3497,6 +3498,101 @@ impl GlobalScope {
             // Step 4. Append record to global's resolved module set.
             self.resolved_module_set.borrow_mut().insert(record);
         }
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#run-a-classic-script>
+    pub(crate) fn run_a_classic_script(
+        &self,
+        script: &ScriptOrigin,
+        line_number: u32,
+        introduction_type: Option<&'static CStr>,
+        can_gc: CanGc,
+    ) {
+        // TODO use a settings object
+        // Step 2
+        if !self.can_run_script() {
+            return;
+        }
+
+        // Steps 4-10
+        rooted!(in(*GlobalScope::get_cx()) let mut rval = UndefinedValue());
+        _ = self.evaluate_script_on_global_with_result(
+            &script.code,
+            script.url.as_str(),
+            rval.handle_mut(),
+            line_number,
+            script.fetch_options.clone(),
+            script.url.clone(),
+            can_gc,
+            introduction_type,
+        );
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#check-if-we-can-run-script>
+    fn can_run_script(&self) -> bool {
+        // Step 1 If the global object specified by settings is a Window object
+        // whose Document object is not fully active, then return "do not run".
+        //
+        // Step 2 If scripting is disabled for settings, then return "do not run".
+        //
+        // An user agent can also disable scripting
+        //
+        // Either settings's global object is not a Window object,
+        // or settings's global object's associated Document's active sandboxing flag set
+        // does not have its sandboxed scripts browsing context flag set.
+        if let Some(window) = self.downcast::<Window>() {
+            let doc = window.Document();
+            doc.is_fully_active() ||
+                !doc.has_active_sandboxing_flag(
+                    SandboxingFlagSet::SANDBOXED_SCRIPTS_BROWSING_CONTEXT_FLAG,
+                )
+        } else {
+            true
+        }
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#run-steps-after-a-timeout>
+    /// TODO: This should end-up being used in the other timer mechanism
+    /// integrate as per <https://html.spec.whatwg.org/multipage/#timers:run-steps-after-a-timeout?
+    pub(crate) fn run_steps_after_a_timeout<F>(
+        &self,
+        ordering_identifier: DOMString,
+        milliseconds: i64,
+        completion_steps: F,
+    ) -> i32
+    where
+        F: 'static + FnOnce(&GlobalScope, CanGc),
+    {
+        let timers = self.timers();
+
+        // Step 1. Let timerKey be a new unique internal value.
+        let timer_key = timers.fresh_runsteps_key();
+
+        // Step 2. Let startTime be the current high resolution time given global.
+        let start_time = timers.now_for_runsteps();
+
+        // Step 3. Set global's map of active timers[timerKey] to startTime plus milliseconds.
+        let ms = milliseconds.max(0) as u64;
+        let delay = std::time::Duration::from_millis(ms);
+        let deadline = start_time + delay;
+        timers.runsteps_set_active(timer_key, deadline);
+
+        // Step 4. Run the following steps in parallel:
+        //   (We schedule a oneshot that will enforce the sub-steps when it fires.)
+        let callback = crate::timers::OneshotTimerCallback::RunStepsAfterTimeout {
+            // Step 1. timerKey
+            timer_key,
+            // Step 4. orderingIdentifier
+            ordering_id: ordering_identifier,
+            // Spec: milliseconds
+            milliseconds: ms,
+            // Step 4.4 Perform completionSteps.
+            completion: Box::new(completion_steps),
+        };
+        let _ = self.schedule_callback(callback, delay);
+
+        // Step 5. Return timerKey.
+        timer_key
     }
 }
 

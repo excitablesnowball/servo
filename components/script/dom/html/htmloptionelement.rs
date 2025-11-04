@@ -101,7 +101,7 @@ impl HTMLOptionElement {
         }
     }
 
-    // https://html.spec.whatwg.org/multipage/#concept-option-index
+    /// <https://html.spec.whatwg.org/multipage/#concept-option-index>
     fn index(&self) -> i32 {
         let Some(owner_select) = self.owner_select_element() else {
             return 0;
@@ -129,7 +129,7 @@ impl HTMLOptionElement {
     fn update_select_validity(&self, can_gc: CanGc) {
         if let Some(select) = self.owner_select_element() {
             select
-                .validity_state()
+                .validity_state(can_gc)
                 .perform_validation_and_update(ValidationFlags::all(), can_gc);
         }
     }
@@ -371,7 +371,7 @@ impl VirtualMethods for HTMLOptionElement {
             .next()
         {
             select
-                .validity_state()
+                .validity_state(can_gc)
                 .perform_validation_and_update(ValidationFlags::all(), can_gc);
             select.ask_for_reset();
         }
@@ -385,9 +385,9 @@ impl VirtualMethods for HTMLOptionElement {
         }
     }
 
-    fn children_changed(&self, mutation: &ChildrenMutation) {
+    fn children_changed(&self, mutation: &ChildrenMutation, can_gc: CanGc) {
         if let Some(super_type) = self.super_type() {
-            super_type.children_changed(mutation);
+            super_type.children_changed(mutation, can_gc);
         }
 
         // Changing the descendants of a selected option can change it's displayed label
@@ -401,7 +401,7 @@ impl VirtualMethods for HTMLOptionElement {
                     .selected_option()
                     .is_some_and(|selected_option| self == &*selected_option)
                 {
-                    owner_select.update_shadow_tree(CanGc::note());
+                    owner_select.update_shadow_tree(can_gc);
                 }
             }
         }

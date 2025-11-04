@@ -16,9 +16,10 @@ use html5ever::{LocalName, Namespace};
 use js::conversions::{ToJSValConvertible, jsstr_to_string};
 use js::gc::MutableHandleValue;
 use js::jsapi::{Heap, JS_GetLatin1StringCharsAndLength, JSContext, JSString};
+use js::jsval::StringValue;
 use js::rust::{Runtime, Trace};
 use malloc_size_of::MallocSizeOfOps;
-use num_traits::Zero;
+use num_traits::{ToPrimitive, Zero};
 use regex::Regex;
 use style::Atom;
 use style::str::HTML_SPACE_CHARACTERS;
@@ -26,13 +27,43 @@ use style::str::HTML_SPACE_CHARACTERS;
 use crate::script_runtime::JSContext as SafeJSContext;
 use crate::trace::RootedTraceableBox;
 
-#[derive(Debug)]
+const ASCII_END: u8 = 0x7E;
+const ASCII_CAPITAL_A: u8 = 0x41;
+const ASCII_CAPITAL_Z: u8 = 0x5A;
+const ASCII_LOWERCASE_A: u8 = 0x61;
+const ASCII_LOWERCASE_Z: u8 = 0x7A;
+const ASCII_TAB: u8 = 0x09;
+const ASCII_NEWLINE: u8 = 0x0A;
+const ASCII_FORMFEED: u8 = 0x0C;
+const ASCII_CR: u8 = 0x0D;
+const ASCII_SPACE: u8 = 0x20;
+
+/// Gets the latin1 bytes from the js engine.
+/// Safety: Make sure the *mut JSString is not null.
+unsafe fn get_latin1_string_bytes(
+    rooted_traceable_box: &RootedTraceableBox<Heap<*mut JSString>>,
+) -> &[u8] {
+    debug_assert!(!rooted_traceable_box.get().is_null());
+    let mut length = 0;
+    unsafe {
+        let chars = JS_GetLatin1StringCharsAndLength(
+            Runtime::get().expect("JS runtime has shut down").as_ptr(),
+            ptr::null(),
+            rooted_traceable_box.get(),
+            &mut length,
+        );
+        assert!(!chars.is_null());
+        slice::from_raw_parts(chars, length)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
 /// A type representing the underlying encoded bytes. Either Latin1 or Utf8.
 pub enum EncodedBytes<'a> {
     /// These bytes are Latin1 encoded.
     Latin1Bytes(&'a [u8]),
-    /// This is a normal utf8 string.
-    Utf8Bytes(&'a str),
+    /// This is a normal utf8 string given in bytes.
+    Utf8Bytes(&'a [u8]),
 }
 
 enum DOMStringType {
@@ -59,10 +90,25 @@ impl DOMStringType {
             &DOMStringType::Latin1Vec(_) => panic!("Cannot do a string"),
         }
     }
+
+    /// Warning:
+    /// This function does not checking and just returns the raw bytes of teh string,
+    /// independently if they are  utf8 or latin1.
+    /// The caller needs to take care that these make sense in context.
+    fn as_raw_bytes(&self) -> &[u8] {
+        match self {
+            DOMStringType::Rust(s) => s.as_bytes(),
+            DOMStringType::JSString(rooted_traceable_box) => unsafe {
+                get_latin1_string_bytes(rooted_traceable_box)
+            },
+            #[cfg(test)]
+            DOMStringType::Latin1Vec(items) => items,
+        }
+    }
 }
 
 #[derive(Debug)]
-/// A view of the underlying string.
+/// A view of the underlying string. This is always converted to Utf8.
 pub struct StringView<'a>(Ref<'a, DOMStringType>);
 
 impl<'a> StringView<'a> {
@@ -83,29 +129,6 @@ impl<'a> StringView<'a> {
 
     pub fn as_bytes(&self) -> &[u8] {
         self.0.str().as_bytes()
-    }
-
-    #[allow(unused)]
-    /// Get the bytes of the string in either latin1 or utf8 without costly conversion.
-    fn encoded_bytes(&self) -> EncodedBytes<'_> {
-        match *self.0 {
-            DOMStringType::Rust(ref s) => EncodedBytes::Utf8Bytes(s.as_str()),
-            DOMStringType::JSString(ref rooted_traceable_box) => {
-                let mut length = 0;
-                unsafe {
-                    let chars = JS_GetLatin1StringCharsAndLength(
-                        Runtime::get().expect("JS runtime has shut down").as_ptr(),
-                        ptr::null(),
-                        rooted_traceable_box.get(),
-                        &mut length,
-                    );
-                    assert!(!chars.is_null());
-                    EncodedBytes::Latin1Bytes(slice::from_raw_parts(chars, length))
-                }
-            },
-            #[cfg(test)]
-            DOMStringType::Latin1Vec(ref s) => EncodedBytes::Latin1Bytes(s.as_slice()),
-        }
     }
 }
 
@@ -154,7 +177,7 @@ impl From<StringView<'_>> for String {
     }
 }
 
-/// Safety comment: ??
+/// Safety comment:
 ///
 /// This method will _not_ trace the pointer if the rust string exists.
 /// The js string could be garbage collected and, hence, violating this
@@ -196,6 +219,41 @@ impl std::fmt::Debug for DOMStringType {
                 .debug_struct("DOMString")
                 .field("latin1_string", s)
                 .finish(),
+        }
+    }
+}
+
+#[derive(Debug)]
+/// A view of the underlying string. This is never converted to Utf8
+pub struct EncodedBytesView<'a>(Ref<'a, DOMStringType>);
+
+impl EncodedBytesView<'_> {
+    /// Get the bytes of the string in either latin1 or utf8 without costly conversion.
+    pub fn encoded_bytes(&self) -> EncodedBytes<'_> {
+        match *self.0 {
+            DOMStringType::Rust(ref s) => EncodedBytes::Utf8Bytes(s.as_bytes()),
+            DOMStringType::JSString(ref rooted_traceable_box) => {
+                EncodedBytes::Latin1Bytes(unsafe { get_latin1_string_bytes(rooted_traceable_box) })
+            },
+            #[cfg(test)]
+            DOMStringType::Latin1Vec(ref s) => EncodedBytes::Latin1Bytes(s),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self.encoded_bytes() {
+            EncodedBytes::Latin1Bytes(items) => items.is_empty(),
+            EncodedBytes::Utf8Bytes(s) => s.is_empty(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self.encoded_bytes() {
+            EncodedBytes::Latin1Bytes(items) => items
+                .iter()
+                .map(|b| if *b <= ASCII_END { 1 } else { 2 })
+                .sum(),
+            EncodedBytes::Utf8Bytes(s) => s.len(),
         }
     }
 }
@@ -250,6 +308,10 @@ impl Clone for DOMString {
     }
 }
 
+pub enum DOMStringErrorType {
+    JSConversionError,
+}
+
 impl DOMString {
     /// Creates a new `DOMString`.
     pub fn new() -> DOMString {
@@ -258,13 +320,17 @@ impl DOMString {
 
     /// Creates the string from js. If the string can be encoded in latin1, just take the reference
     /// to the JSString. Otherwise do the conversion to utf8 now.
-    pub fn from_js_string(cx: SafeJSContext, value: js::gc::HandleValue) -> DOMString {
+    pub fn from_js_string(
+        cx: SafeJSContext,
+        value: js::gc::HandleValue,
+    ) -> Result<DOMString, DOMStringErrorType> {
         let string_ptr = unsafe { js::rust::ToString(*cx, value) };
-        let inner = if string_ptr.is_null() {
-            DOMStringType::Rust(String::new())
+        if string_ptr.is_null() {
+            debug!("ToString failed");
+            Err(DOMStringErrorType::JSConversionError)
         } else {
             let latin1 = unsafe { js::jsapi::JS_DeprecatedStringHasLatin1Chars(string_ptr) };
-            if latin1 {
+            let inner = if latin1 {
                 let h = RootedTraceableBox::from_box(Heap::boxed(string_ptr));
                 DOMStringType::JSString(h)
             } else {
@@ -272,9 +338,9 @@ impl DOMString {
                 DOMStringType::Rust(unsafe {
                     jsstr_to_string(*cx, ptr::NonNull::new(string_ptr).unwrap())
                 })
-            }
-        };
-        DOMString(RefCell::new(inner))
+            };
+            Ok(DOMString(RefCell::new(inner)))
+        }
     }
 
     pub fn from_string(s: String) -> DOMString {
@@ -336,19 +402,23 @@ impl DOMString {
         StringView(self.0.borrow())
     }
 
+    /// Use this if you want to work on the `EncodedBytes` directly.
+    /// This will not do any conversions for you.
+    pub fn view(&self) -> EncodedBytesView<'_> {
+        EncodedBytesView(self.0.borrow())
+    }
+
     pub fn clear(&mut self) {
         *self.0.borrow_mut() = DOMStringType::Rust(String::new())
     }
 
     pub fn is_empty(&self) -> bool {
-        self.make_rust();
-        self.str().is_empty()
+        self.view().is_empty()
     }
 
-    /// This length (as rust spec) is in bytes not chars.
+    /// This length (as rust spec) is in bytes if the string would be utf8 not chars.
     pub fn len(&self) -> usize {
-        self.make_rust();
-        self.str().len()
+        self.view().len()
     }
 
     pub fn make_ascii_lowercase(&mut self) {
@@ -370,6 +440,7 @@ impl DOMString {
             return;
         }
 
+        self.make_rust();
         if let DOMStringType::Rust(ref mut s) = *self.0.borrow_mut() {
             let trailing_whitespace_len = s
                 .trim_end_matches(|ref c| char::is_ascii_whitespace(c))
@@ -457,15 +528,19 @@ impl DOMString {
         )))
     }
 
-    pub fn find(&self, c: char) -> Option<usize> {
-        self.make_rust();
-        self.str().find(c)
-    }
-
     /// Pattern is not yet stable in rust, hence, we need different methods for str and char
     pub fn starts_with(&self, c: char) -> bool {
-        self.make_rust();
-        self.str().starts_with(c)
+        if !c.is_ascii() {
+            self.make_rust();
+            self.str().starts_with(c)
+        } else {
+            match self.view().encoded_bytes() {
+                EncodedBytes::Latin1Bytes(items) => items,
+                EncodedBytes::Utf8Bytes(s) => s,
+            }
+            // For both cases as we tested the char being ascii we can safely convert to a single u8.
+            .starts_with(&[c as u8])
+        }
     }
 
     pub fn starts_with_str(&self, needle: &str) -> bool {
@@ -479,19 +554,93 @@ impl DOMString {
     }
 
     pub fn to_ascii_lowercase(&self) -> String {
-        self.make_rust();
-        self.str().to_ascii_lowercase()
+        let conversion = match self.view().encoded_bytes() {
+            EncodedBytes::Latin1Bytes(items) => {
+                if items.iter().all(|c| *c <= ASCII_END) {
+                    // We are just simple ascii
+                    Some(unsafe {
+                        String::from_utf8_unchecked(
+                            items
+                                .iter()
+                                .map(|c| {
+                                    if *c >= ASCII_CAPITAL_A && *c <= ASCII_CAPITAL_Z {
+                                        c + 32
+                                    } else {
+                                        *c
+                                    }
+                                })
+                                .collect(),
+                        )
+                    })
+                } else {
+                    None
+                }
+            },
+            EncodedBytes::Utf8Bytes(s) => unsafe {
+                // Save because we know it was a utf8 string
+                Some(str::from_utf8_unchecked(s).to_ascii_lowercase())
+            },
+        };
+        // We otherwise would double borrow the refcell
+        if let Some(conversion) = conversion {
+            conversion
+        } else {
+            self.make_rust();
+            self.str().to_ascii_lowercase()
+        }
     }
 
     pub fn contains_html_space_characters(&self) -> bool {
-        self.make_rust();
-        self.str().contains(HTML_SPACE_CHARACTERS)
+        const SPACE_BYTES: [u8; 5] = [
+            ASCII_TAB,
+            ASCII_NEWLINE,
+            ASCII_FORMFEED,
+            ASCII_CR,
+            ASCII_SPACE,
+        ];
+        match self.view().encoded_bytes() {
+            EncodedBytes::Latin1Bytes(items) => SPACE_BYTES.iter().any(|byte| items.contains(byte)),
+            EncodedBytes::Utf8Bytes(s) => {
+                // Save because we know it was a utf8 string
+                let s = unsafe { str::from_utf8_unchecked(s) };
+                s.contains(HTML_SPACE_CHARACTERS)
+            },
+        }
     }
 
-    /// This returns the string in utf8 bytes, i.e., `[u8]`.
+    /// This returns the string in utf8 bytes, i.e., `[u8]` encoded with utf8.
     pub fn as_bytes(&self) -> BytesView<'_> {
-        self.make_rust();
-        BytesView(self.0.borrow())
+        // BytesView will just give the raw bytes on dereference.
+        // If we are ascii this is the same for latin1 and utf8.
+        // Otherwise we convert to rust.
+        if self.is_ascii() {
+            BytesView(self.0.borrow())
+        } else {
+            self.make_rust();
+            BytesView(self.0.borrow())
+        }
+    }
+
+    /// Tests if there are only ascii lowercase characters. Does not include special characters.
+    pub fn is_ascii_lowercase(&self) -> bool {
+        match self.view().encoded_bytes() {
+            EncodedBytes::Latin1Bytes(items) => items
+                .iter()
+                .all(|c| (ASCII_LOWERCASE_A..=ASCII_LOWERCASE_Z).contains(c)),
+            EncodedBytes::Utf8Bytes(s) => s
+                .iter()
+                .map(|c| c.to_u8().unwrap_or(ASCII_LOWERCASE_A - 1))
+                .all(|c| (ASCII_LOWERCASE_A..=ASCII_LOWERCASE_Z).contains(&c)),
+        }
+    }
+
+    /// Is the string only ascii characters
+    pub fn is_ascii(&self) -> bool {
+        match self.view().encoded_bytes() {
+            EncodedBytes::Latin1Bytes(items) => items,
+            EncodedBytes::Utf8Bytes(items) => items,
+        }
+        .is_ascii()
     }
 }
 
@@ -515,7 +664,8 @@ impl Deref for BytesView<'_> {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        self.0.str().as_bytes()
+        // This does the correct thing by the construction of BytesView in `DOMString::as_bytes`.
+        self.0.as_raw_bytes()
     }
 }
 
@@ -545,11 +695,29 @@ impl Extend<char> for DOMString {
 }
 
 impl ToJSValConvertible for DOMString {
-    unsafe fn to_jsval(&self, cx: *mut JSContext, rval: MutableHandleValue) {
-        self.make_rust();
-        unsafe {
-            self.str().to_jsval(cx, rval);
-        }
+    unsafe fn to_jsval(&self, cx: *mut JSContext, mut rval: MutableHandleValue) {
+        let val = self.0.borrow();
+        match *val {
+            DOMStringType::Rust(ref s) => unsafe {
+                s.to_jsval(cx, rval);
+            },
+            DOMStringType::JSString(ref rooted_traceable_box) => unsafe {
+                rval.set(StringValue(&*rooted_traceable_box.get()));
+            },
+            #[cfg(test)]
+            DOMStringType::Latin1Vec(ref items) => {
+                let mut v = vec![0; items.len() * 2];
+                let real_size = tendril::encoding_rs::mem::convert_latin1_to_utf8(
+                    items.as_slice(),
+                    v.as_mut_slice(),
+                );
+                v.truncate(real_size);
+
+                String::from_utf8(v)
+                    .expect("Error in constructin test string")
+                    .to_jsval(cx, rval);
+            },
+        };
     }
 }
 
@@ -575,21 +743,46 @@ impl Default for DOMString {
 
 impl std::cmp::PartialEq<str> for DOMString {
     fn eq(&self, other: &str) -> bool {
-        self.make_rust();
-        self.str().deref() == other
+        if other.is_ascii() {
+            other.as_bytes() ==
+                match self.view().encoded_bytes() {
+                    EncodedBytes::Latin1Bytes(items) => items,
+                    EncodedBytes::Utf8Bytes(s) => s,
+                }
+        } else {
+            self.make_rust();
+            self.str().deref() == other
+        }
     }
 }
 
 impl std::cmp::PartialEq<&str> for DOMString {
     fn eq(&self, other: &&str) -> bool {
-        self.make_rust();
-        self.str().deref() == *other
+        if other.is_ascii() {
+            other.as_bytes() ==
+                match self.view().encoded_bytes() {
+                    EncodedBytes::Latin1Bytes(items) => items,
+                    EncodedBytes::Utf8Bytes(s) => s,
+                }
+        } else {
+            self.make_rust();
+            self.str().deref() == *other
+        }
     }
 }
 
 impl std::cmp::PartialEq<String> for DOMString {
     fn eq(&self, other: &String) -> bool {
-        self.eq(&other.as_str())
+        if other.is_ascii() {
+            other.as_bytes() ==
+                match self.view().encoded_bytes() {
+                    EncodedBytes::Latin1Bytes(items) => items,
+                    EncodedBytes::Utf8Bytes(s) => s,
+                }
+        } else {
+            self.make_rust();
+            self.str().deref() == other
+        }
     }
 }
 
@@ -607,9 +800,31 @@ impl std::cmp::PartialEq<DOMString> for str {
 
 impl std::cmp::PartialEq for DOMString {
     fn eq(&self, other: &DOMString) -> bool {
-        self.make_rust();
-        other.make_rust();
-        self.str() == other.str()
+        let result = match (self.view().encoded_bytes(), other.view().encoded_bytes()) {
+            (EncodedBytes::Latin1Bytes(items), EncodedBytes::Latin1Bytes(other_items)) => {
+                Some(items == other_items)
+            },
+            (EncodedBytes::Latin1Bytes(items), EncodedBytes::Utf8Bytes(other_s))
+                if other_s.is_ascii() =>
+            {
+                Some(items == other_s)
+            },
+            (EncodedBytes::Utf8Bytes(s), EncodedBytes::Latin1Bytes(other_items))
+                if s.is_ascii() =>
+            {
+                Some(s == other_items)
+            },
+            (EncodedBytes::Utf8Bytes(s), EncodedBytes::Utf8Bytes(other_s)) => Some(s == other_s),
+            _ => None,
+        };
+
+        if let Some(eq_result) = result {
+            eq_result
+        } else {
+            self.make_rust();
+            other.make_rust();
+            self.str() == other.str()
+        }
     }
 }
 
@@ -623,6 +838,23 @@ impl From<std::string::String> for DOMString {
 
 impl From<DOMString> for LocalName {
     fn from(contents: DOMString) -> LocalName {
+        {
+            let view = contents.view();
+            let bytes = view.encoded_bytes();
+            let str = match bytes {
+                EncodedBytes::Latin1Bytes(items) => {
+                    if items.iter().all(|c| c.is_ascii()) {
+                        unsafe { Some(str::from_utf8_unchecked(items)) }
+                    } else {
+                        None
+                    }
+                },
+                EncodedBytes::Utf8Bytes(s) => Some(unsafe { str::from_utf8_unchecked(s) }),
+            };
+            if let Some(s) = str {
+                return LocalName::from(s);
+            }
+        }
         contents.make_rust();
         LocalName::from(contents.str().deref())
     }
@@ -630,6 +862,24 @@ impl From<DOMString> for LocalName {
 
 impl From<&DOMString> for LocalName {
     fn from(contents: &DOMString) -> LocalName {
+        {
+            let view = contents.view();
+            let bytes = view.encoded_bytes();
+            let str = match bytes {
+                EncodedBytes::Latin1Bytes(items) => {
+                    if items.iter().all(|c| c.is_ascii()) {
+                        // This is safe as the string is ascii and it comes from a DOMString
+                        unsafe { Some(str::from_utf8_unchecked(items)) }
+                    } else {
+                        None
+                    }
+                },
+                EncodedBytes::Utf8Bytes(s) => Some(unsafe { str::from_utf8_unchecked(s) }),
+            };
+            if let Some(s) = str {
+                return LocalName::from(s);
+            }
+        }
         contents.make_rust();
         LocalName::from(contents.str().deref())
     }
@@ -637,6 +887,24 @@ impl From<&DOMString> for LocalName {
 
 impl From<DOMString> for Namespace {
     fn from(contents: DOMString) -> Namespace {
+        {
+            let view = contents.view();
+            let bytes = view.encoded_bytes();
+            let str = match bytes {
+                EncodedBytes::Latin1Bytes(items) => {
+                    if items.iter().all(|c| c.is_ascii()) {
+                        // This is safe as the string is ascii and it comes from a DOMString
+                        unsafe { Some(str::from_utf8_unchecked(items)) }
+                    } else {
+                        None
+                    }
+                },
+                EncodedBytes::Utf8Bytes(s) => Some(unsafe { str::from_utf8_unchecked(s) }),
+            };
+            if let Some(s) = str {
+                return Namespace::from(s);
+            }
+        }
         contents.make_rust();
         Namespace::from(contents.str().deref())
     }
@@ -644,6 +912,24 @@ impl From<DOMString> for Namespace {
 
 impl From<DOMString> for Atom {
     fn from(contents: DOMString) -> Atom {
+        {
+            let view = contents.view();
+            let bytes = view.encoded_bytes();
+            let str = match bytes {
+                EncodedBytes::Latin1Bytes(items) => {
+                    if items.iter().all(|c| c.is_ascii()) {
+                        // Safety: The string only has ascii chars, hence this is ok.
+                        unsafe { Some(str::from_utf8_unchecked(items)) }
+                    } else {
+                        None
+                    }
+                },
+                EncodedBytes::Utf8Bytes(s) => Some(unsafe { str::from_utf8_unchecked(s) }),
+            };
+            if let Some(s) = str {
+                return Atom::from(s);
+            }
+        }
         contents.make_rust();
         Atom::from(contents.str().deref())
     }
@@ -675,9 +961,64 @@ impl From<Cow<'_, str>> for DOMString {
     }
 }
 
+#[macro_export]
+macro_rules! match_domstring_ascii_inner {
+    ($variant: expr, $input: expr, $p: literal => $then: expr, $($rest:tt)*) => {
+        if {
+            debug_assert!(($p).is_ascii());
+            $variant($p.as_bytes())
+        } == $input {
+          $then
+        } else {
+            match_domstring_ascii_inner!($variant, $input, $($rest)*)
+        }
+
+    };
+    ($variant: expr, $input: expr, $p: pat => $then: expr,) => {
+        match $input {
+            $p => $then
+        }
+    }
+}
+
+/// Use this to match &str against lazydomstring efficiently.
+/// You are only allowed to match ascii strings otherwise this macro will
+/// lead to wrong results.
+/// ```ignore
+/// let s = DOMString::from_string(String::from("test"));
+/// let value = match_domstring!(s,
+/// "test1" => 1,
+/// "test2" => 2,
+/// "test" => 3,
+/// _ => 4,
+/// );
+/// assert_eq!(value, 3);
+/// ```
+#[macro_export]
+macro_rules! match_domstring_ascii {
+    ($input:expr, $($tail:tt)*) => {
+        {
+            use $crate::match_domstring_ascii_inner;
+            use $crate::domstring::EncodedBytes;
+
+            let view = $input.view();
+            let s = view.encoded_bytes();
+            if matches!(s, EncodedBytes::Latin1Bytes(_)) {
+                match_domstring_ascii_inner!(EncodedBytes::Latin1Bytes, s, $($tail)*)
+            } else {
+                match_domstring_ascii_inner!(EncodedBytes::Utf8Bytes, s, $($tail)*)
+            }
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LATIN1_PILLCROW: u8 = 0xB6;
+    const UTF8_PILLCROW: [u8; 2] = [194, 182];
+    const LATIN1_POWER2: u8 = 0xB2;
 
     fn from_latin1(l1vec: Vec<u8>) -> DOMString {
         DOMString(RefCell::new(DOMStringType::Latin1Vec(l1vec)))
@@ -692,7 +1033,8 @@ mod tests {
         assert_eq!(s.len(), 12);
         assert_eq!(s_copy.len(), 12);
         assert!(s.starts_with('A'));
-        assert_eq!(s.find('#'), Some(11));
+        let s2 = DOMString::from("");
+        assert!(s2.is_empty());
     }
 
     #[test]
@@ -704,15 +1046,75 @@ mod tests {
             assert_eq!(s.to_ascii_lowercase(), "abbcc&%$#²");
         }
         {
+            let s = from_latin1(vec![b'A', b'b', b'B', b'c', b'C']);
+            assert_eq!(s.to_ascii_lowercase(), "abbcc");
+        }
+        {
             let s = from_latin1(vec![
                 b'A', b'b', b'B', b'c', b'C', b'&', b'%', b'$', b'#', 0xB2,
             ]);
             assert_eq!(s.len(), 11);
             assert!(s.starts_with('A'));
-            assert_eq!(s.find('#'), Some(8));
-            assert_eq!(s.find(char::from_u32(0x00B2).unwrap()), Some(9));
-            assert_eq!(s.find('d'), None);
         }
+        {
+            let s = from_latin1(vec![]);
+            assert!(s.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_length() {
+        let s1 = from_latin1(vec![
+            0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD,
+            0xAE, 0xAF,
+        ]);
+        let s2 = from_latin1(vec![
+            0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xBB, 0xBC, 0xBD,
+            0xBE, 0xBF,
+        ]);
+        let s3 = from_latin1(vec![
+            0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xCB, 0xCC, 0xCD,
+            0xCE, 0xCF,
+        ]);
+        let s4 = from_latin1(vec![
+            0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xDB, 0xDC, 0xDD,
+            0xDE, 0xDF,
+        ]);
+        let s5 = from_latin1(vec![
+            0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA, 0xEB, 0xEC, 0xED,
+            0xEE, 0xEF,
+        ]);
+        let s6 = from_latin1(vec![
+            0xF0, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8, 0xF9, 0xFA, 0xFB, 0xFC, 0xFD,
+            0xFE, 0xFF,
+        ]);
+
+        let s1_utf8 = String::from("\u{00A0}¡¢£¤¥¦§¨©ª«¬\u{00AD}®¯");
+        let s2_utf8 = String::from("°±²³´µ¶·¸¹º»¼½¾¿");
+        let s3_utf8 = String::from("ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏ");
+        let s4_utf8 = String::from("ÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞß");
+        let s5_utf8 = String::from("àáâãäåæçèéêëìíîï");
+        let s6_utf8 = String::from("ðñòóôõö÷øùúûüýþÿ");
+
+        assert_eq!(s1.len(), s1_utf8.len());
+        assert_eq!(s2.len(), s2_utf8.len());
+        assert_eq!(s3.len(), s3_utf8.len());
+        assert_eq!(s4.len(), s4_utf8.len());
+        assert_eq!(s5.len(), s5_utf8.len());
+        assert_eq!(s6.len(), s6_utf8.len());
+
+        s1.make_rust();
+        s2.make_rust();
+        s3.make_rust();
+        s4.make_rust();
+        s5.make_rust();
+        s6.make_rust();
+        assert_eq!(s1.len(), s1_utf8.len());
+        assert_eq!(s2.len(), s2_utf8.len());
+        assert_eq!(s3.len(), s3_utf8.len());
+        assert_eq!(s4.len(), s4_utf8.len());
+        assert_eq!(s5.len(), s5_utf8.len());
+        assert_eq!(s6.len(), s6_utf8.len());
     }
 
     #[test]
@@ -733,12 +1135,10 @@ mod tests {
 
     #[test]
     fn encoded_bytes() {
-        let s = from_latin1(vec![b'a', b'b', b'c', b'%', b'$', 0xB2]);
-        // At the moment we always convert
-        if let EncodedBytes::Utf8Bytes(s) = s.str().encoded_bytes() {
-            assert_eq!(s, "abc%$²")
-        } else {
-            assert!(false)
+        let bytes = vec![b'a', b'b', b'c', b'%', b'$', 0xB2];
+        let s = from_latin1(bytes.clone());
+        if let EncodedBytes::Latin1Bytes(s) = s.view().encoded_bytes() {
+            assert_eq!(s, bytes)
         }
     }
 
@@ -777,5 +1177,289 @@ mod tests {
 
         assert_eq!(hash_s, hash_s2);
         assert_eq!(hash_s, hash_s_converted);
+    }
+
+    // Testing match_lazydomstring if it executes the statements in the match correctly
+    #[test]
+    fn test_match_executing() {
+        // executing
+        {
+            let s = from_latin1(vec![b'a', b'b', b'c']);
+            match_domstring_ascii!( s,
+                "abc" => assert!(true),
+                "bcd" => assert!(false),
+                _ =>  (),
+            );
+        }
+
+        {
+            let s = from_latin1(vec![b'a', b'b', b'c', b'/']);
+            match_domstring_ascii!( s,
+                "abc/" => assert!(true),
+                "bcd" => assert!(false),
+                _ =>  (),
+            );
+        }
+
+        {
+            let s = from_latin1(vec![b'a', b'b', b'c', b'%', b'$']);
+            match_domstring_ascii!( s,
+                "bcd" => assert!(false),
+                "abc%$" => assert!(true),
+                _ => (),
+            );
+        }
+
+        {
+            let s = DOMString::from_string(String::from("abcde"));
+            match_domstring_ascii!( s,
+                "abc" => assert!(false),
+                "bcd" => assert!(false),
+                _ => assert!(true),
+            );
+        }
+        {
+            let s = DOMString::from_string(String::from("abc%$"));
+            match_domstring_ascii!( s,
+                "bcd" => assert!(false),
+                "abc%$" => assert!(true),
+                _ =>  (),
+            );
+        }
+        {
+            let s = from_latin1(vec![b'a', b'b', b'c']);
+            match_domstring_ascii!( s,
+                "abcdd" => assert!(false),
+                "bcd" => assert!(false),
+                _ => (),
+            );
+        }
+    }
+
+    // Testing match_lazydomstring if it evaluates to the correct expression
+    #[test]
+    fn test_match_returning_result() {
+        {
+            let s = from_latin1(vec![b'a', b'b', b'c']);
+            let res = match_domstring_ascii!( s,
+                "abc" => true,
+                "bcd" => false,
+                _ => false,
+            );
+            assert_eq!(res, true);
+        }
+        {
+            let s = from_latin1(vec![b'a', b'b', b'c', b'/']);
+            let res = match_domstring_ascii!( s,
+                "abc/" => true,
+                "bcd" => false,
+                _ => false,
+            );
+            assert_eq!(res, true);
+        }
+        {
+            let s = from_latin1(vec![b'a', b'b', b'c', b'%', b'$']);
+            let res = match_domstring_ascii!( s,
+                "bcd" => false,
+                "abc%$" => true,
+                _ => false,
+            );
+            assert_eq!(res, true);
+        }
+
+        {
+            let s = DOMString::from_string(String::from("abcde"));
+            let res = match_domstring_ascii!( s,
+                "abc" => false,
+                "bcd" => false,
+                _ => true,
+            );
+            assert_eq!(res, true);
+        }
+        {
+            let s = DOMString::from_string(String::from("abc%$"));
+            let res = match_domstring_ascii!( s,
+                "bcd" => false,
+                "abc%$" => true,
+                _ => false,
+            );
+            assert_eq!(res, true);
+        }
+        {
+            let s = from_latin1(vec![b'a', b'b', b'c']);
+            let res = match_domstring_ascii!( s,
+                "abcdd" => false,
+                "bcd" => false,
+                _ => true,
+            );
+            assert_eq!(res, true);
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_match_panic() {
+        let s = DOMString::from_string(String::from("abcd"));
+        let _res = match_domstring_ascii!(s,
+            "❤" => true,
+            _ => false,);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_match_panic2() {
+        let s = DOMString::from_string(String::from("abcd"));
+        let _res = match_domstring_ascii!(s,
+            "abc" => false,
+            "❤" => true,
+            _ => false,
+        );
+    }
+
+    #[test]
+    fn test_strip_whitespace() {
+        {
+            let mut s = from_latin1(vec![
+                b' ', b' ', b' ', b'\n', b' ', b'a', b'b', b'c', b'%', b'$', 0xB2, b' ',
+            ]);
+
+            s.strip_leading_and_trailing_ascii_whitespace();
+            s.make_rust();
+            assert_eq!(&*s.str(), "abc%$²");
+        }
+        {
+            let mut s = DOMString::from_string(String::from("   \n  abc%$ "));
+
+            s.strip_leading_and_trailing_ascii_whitespace();
+            s.make_rust();
+            assert_eq!(&*s.str(), "abc%$");
+        }
+    }
+
+    // https://infra.spec.whatwg.org/#ascii-whitespace
+    #[test]
+    fn contains_html_space_characters() {
+        let s = from_latin1(vec![b'a', b'a', b'a', ASCII_TAB, b'a', b'a']); // TAB
+        assert!(s.contains_html_space_characters());
+        s.make_rust();
+        assert!(s.contains_html_space_characters());
+
+        let s = from_latin1(vec![b'a', b'a', b'a', ASCII_NEWLINE, b'a', b'a']); // NEWLINE
+        assert!(s.contains_html_space_characters());
+        s.make_rust();
+        assert!(s.contains_html_space_characters());
+
+        let s = from_latin1(vec![b'a', b'a', b'a', ASCII_FORMFEED, b'a', b'a']); // FF
+        assert!(s.contains_html_space_characters());
+        s.make_rust();
+        assert!(s.contains_html_space_characters());
+
+        let s = from_latin1(vec![b'a', b'a', b'a', ASCII_CR, b'a', b'a']); // Carriage Return
+        assert!(s.contains_html_space_characters());
+        s.make_rust();
+        assert!(s.contains_html_space_characters());
+
+        let s = from_latin1(vec![b'a', b'a', b'a', ASCII_SPACE, b'a', b'a']); // SPACE
+        assert!(s.contains_html_space_characters());
+        s.make_rust();
+        assert!(s.contains_html_space_characters());
+
+        let s = from_latin1(vec![b'a', b'a', b'a', b'a', b'a']);
+        assert!(!s.contains_html_space_characters());
+        s.make_rust();
+        assert!(!s.contains_html_space_characters());
+    }
+
+    #[test]
+    fn atom() {
+        let s = from_latin1(vec![b'a', b'a', b'a', 0x20, b'a', b'a']);
+        let atom1 = Atom::from(s);
+        let s2 = DOMString::from_string(String::from("aaa aa"));
+        let atom2 = Atom::from(s2);
+        assert_eq!(atom1, atom2);
+        let s3 = from_latin1(vec![b'a', b'a', b'a', 0xB2, b'a', b'a']);
+        let atom3 = Atom::from(s3);
+        assert_ne!(atom1, atom3);
+    }
+
+    #[test]
+    fn namespace() {
+        let s = from_latin1(vec![b'a', b'a', b'a', ASCII_SPACE, b'a', b'a']);
+        let atom1 = Namespace::from(s);
+        let s2 = DOMString::from_string(String::from("aaa aa"));
+        let atom2 = Namespace::from(s2);
+        assert_eq!(atom1, atom2);
+        let s3 = from_latin1(vec![b'a', b'a', b'a', LATIN1_POWER2, b'a', b'a']);
+        let atom3 = Namespace::from(s3);
+        assert_ne!(atom1, atom3);
+    }
+
+    #[test]
+    fn localname() {
+        let s = from_latin1(vec![b'a', b'a', b'a', ASCII_SPACE, b'a', b'a']);
+        let atom1 = LocalName::from(s);
+        let s2 = DOMString::from_string(String::from("aaa aa"));
+        let atom2 = LocalName::from(s2);
+        assert_eq!(atom1, atom2);
+        let s3 = from_latin1(vec![b'a', b'a', b'a', LATIN1_POWER2, b'a', b'a']);
+        let atom3 = LocalName::from(s3);
+        assert_ne!(atom1, atom3);
+    }
+
+    #[test]
+    fn is_ascii_lowercase() {
+        let s = from_latin1(vec![b'a', b'a', b'a', ASCII_SPACE, b'a', b'a']);
+        assert!(!s.is_ascii_lowercase());
+        let s = from_latin1(vec![b'a', b'a', b'a', LATIN1_PILLCROW, b'a', b'a']);
+        assert!(!s.is_ascii_lowercase());
+        let s = from_latin1(vec![b'a', b'a', b'a', b'a', b'z']);
+        assert!(s.is_ascii_lowercase());
+        let s = from_latin1(vec![b'`', b'a', b'a', b'a', b'z']);
+        assert!(!s.is_ascii_lowercase());
+        let s = DOMString::from_string(String::from("`aaaz"));
+        assert!(!s.is_ascii_lowercase());
+        let s = DOMString::from_string(String::from("aaaz"));
+        assert!(s.is_ascii_lowercase());
+    }
+
+    #[test]
+    fn test_as_bytes() {
+        const ASCII_SMALL_A: u8 = b'a';
+        const ASCII_SMALL_Z: u8 = b'z';
+
+        let v1 = vec![b'a', b'a', b'a', LATIN1_PILLCROW, b'a', b'a'];
+        let s = from_latin1(v1.clone());
+        assert_eq!(
+            *s.as_bytes(),
+            [
+                ASCII_SMALL_A,
+                ASCII_SMALL_A,
+                ASCII_SMALL_A,
+                UTF8_PILLCROW[0],
+                UTF8_PILLCROW[1],
+                ASCII_SMALL_A,
+                ASCII_SMALL_A
+            ]
+        );
+
+        let v2 = vec![b'a', b'a', b'a', b'a', b'z'];
+        let s = from_latin1(v2.clone());
+        assert_eq!(
+            *s.as_bytes(),
+            [
+                ASCII_SMALL_A,
+                ASCII_SMALL_A,
+                ASCII_SMALL_A,
+                ASCII_SMALL_A,
+                ASCII_SMALL_Z
+            ]
+        );
+
+        let str = "abc%$²".to_owned();
+        let s = DOMString::from(str.clone());
+        assert_eq!(&*s.as_bytes(), str.as_bytes());
+        let str = "AbBcC❤&%$#".to_owned();
+        let s = DOMString::from(str.clone());
+        assert_eq!(&*s.as_bytes(), str.as_bytes());
     }
 }

@@ -37,7 +37,8 @@ use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::reflector::reflect_dom_object;
 use crate::dom::bindings::root::{Dom, DomRoot, LayoutDom, MutNullableDom, ToLayout};
 use crate::dom::bindings::str::DOMString;
-use crate::dom::cssstylesheet::CSSStyleSheet;
+use crate::dom::css::cssstylesheet::CSSStyleSheet;
+use crate::dom::css::stylesheetlist::{StyleSheetList, StyleSheetListOwner};
 use crate::dom::document::Document;
 use crate::dom::documentfragment::DocumentFragment;
 use crate::dom::documentorshadowroot::{
@@ -46,10 +47,9 @@ use crate::dom::documentorshadowroot::{
 use crate::dom::element::Element;
 use crate::dom::html::htmlslotelement::HTMLSlotElement;
 use crate::dom::node::{
-    BindContext, Node, NodeDamage, NodeFlags, NodeTraits, ShadowIncluding, UnbindContext,
-    VecPreOrderInsertionHelper,
+    BindContext, IsShadowTree, Node, NodeDamage, NodeFlags, NodeTraits, ShadowIncluding,
+    UnbindContext, VecPreOrderInsertionHelper,
 };
-use crate::dom::stylesheetlist::{StyleSheetList, StyleSheetListOwner};
 use crate::dom::trustedhtml::TrustedHTML;
 use crate::dom::types::EventTarget;
 use crate::dom::virtualmethods::{VirtualMethods, vtable_for};
@@ -363,13 +363,13 @@ impl ShadowRoot {
 }
 
 impl ShadowRootMethods<crate::DomTypeHolder> for ShadowRoot {
-    // https://html.spec.whatwg.org/multipage/#dom-document-activeelement
+    /// <https://html.spec.whatwg.org/multipage/#dom-document-activeelement>
     fn GetActiveElement(&self) -> Option<DomRoot<Element>> {
         self.document_or_shadow_root
             .get_active_element(self.get_focused_element(), None, None)
     }
 
-    // https://drafts.csswg.org/cssom-view/#dom-document-elementfrompoint
+    /// <https://drafts.csswg.org/cssom-view/#dom-document-elementfrompoint>
     fn ElementFromPoint(&self, x: Finite<f64>, y: Finite<f64>) -> Option<DomRoot<Element>> {
         // Return the result of running the retargeting algorithm with context object
         // and the original result as input.
@@ -389,7 +389,7 @@ impl ShadowRootMethods<crate::DomTypeHolder> for ShadowRoot {
         }
     }
 
-    // https://drafts.csswg.org/cssom-view/#dom-document-elementsfrompoint
+    /// <https://drafts.csswg.org/cssom-view/#dom-document-elementsfrompoint>
     fn ElementsFromPoint(&self, x: Finite<f64>, y: Finite<f64>) -> Vec<DomRoot<Element>> {
         // Return the result of running the retargeting algorithm with context object
         // and the original result as input
@@ -434,7 +434,7 @@ impl ShadowRootMethods<crate::DomTypeHolder> for ShadowRoot {
         self.host.as_rooted()
     }
 
-    // https://drafts.csswg.org/cssom/#dom-document-stylesheets
+    /// <https://drafts.csswg.org/cssom/#dom-document-stylesheets>
     fn StyleSheets(&self) -> DomRoot<StyleSheetList> {
         self.stylesheet_list.or_init(|| {
             StyleSheetList::new(
@@ -575,7 +575,7 @@ impl VirtualMethods for ShadowRoot {
 
         shadow_root.set_flag(NodeFlags::IS_CONNECTED, context.tree_connected);
 
-        let context = BindContext::new(shadow_root);
+        let context = BindContext::new(shadow_root, IsShadowTree::Yes);
 
         // avoid iterate over the shadow root itself
         for node in shadow_root.traverse_preorder(ShadowIncluding::Yes).skip(1) {
